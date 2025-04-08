@@ -23,7 +23,7 @@ class BaseApp(ChromaDB_VectorStore, OpenAI_Chat):
 
 
 base_app = BaseApp(config={
-    'model': 'deepseek/deepseek-chat:free',
+    'model': 'deepseek/deepseek-chat-v3-0324:free',
     "path": chromadb_path,
     "client": "persistent",
     "temperature": 0.3,

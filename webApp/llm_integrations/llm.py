@@ -79,9 +79,9 @@ class OpenAI_Chat(CopilotBase):
             "stop": None,
             "temperature": self.temperature
         }
-        print("\n============prompt sent============\n")
-        print(params)
-        print("\n===============================\n")
+        # print("\n============prompt sent============\n")
+        # print(params)
+        # print("\n===============================\n")
         response = self.client.chat.completions.create(**params)
 
         # Return the first response with text, or the first response's content

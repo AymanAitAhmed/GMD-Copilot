@@ -20,6 +20,7 @@ from .exceptions import ImproperlyConfigured, ValidationError
 from .training_plan import TrainingPlan, TrainingPlanItem
 
 
+
 class CopilotBase(ABC):
     def __init__(self, config=None):
         if config is None:
@@ -355,7 +356,13 @@ class CopilotBase(ABC):
 
         message_log = [
             self.system_message(
-                f"You are a helpful data assistant for an industrial company that specialises in automotive metal manufacturing.\n\n The user asked the question: '{question}'\n\nThe following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n"
+                f"You are a helpful data assistant for an industrial company that specialises in automotive metal manufacturing.\n\n"
+            ),
+            self.system_message(
+                f"here is the related documentation used in the company: {self.get_related_documentation}\n\n"
+            ),
+            self.system_message(
+                f"The user asked the question: '{question}'\n\nThe following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n"
             ),
             self.user_message(
                 "give a brief insightful report on the data generated based on the question asked. \n\ndont mention anything about the sql query just the data." +

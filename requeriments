@@ -1,0 +1,25 @@
+# External API & LLM integrations
+openai
+
+# Markdown processing
+Markdown
+
+# Data handling & analysis
+pandas
+duckdb
+
+# Plotting libraries
+plotly
+
+# HTTP requests and URL processing
+requests
+sqlparse
+
+# Web framework and related utilities
+flask
+flasgger
+werkzeug
+flask-sock
+
+# ChromaDB vector store integration
+chromadb

@@ -1175,18 +1175,6 @@ class FlaskAPI:
                 in: query|body
                 type: string
                 required: true
-            responses:
-              200:
-                schema:
-                  type: object
-                  properties:
-                    type:
-                      type: string
-                      default: text
-                    id:
-                      type: string
-                    text:
-                      type: string
             """
             if self.allow_llm_to_see_data:
                 sql = self.cache.get(id=id, field="sql")
@@ -1205,7 +1193,7 @@ class FlaskAPI:
                     {
                         "type": "text",
                         "id": id,
-                        "text": "Summarization can be enabled if you set allow_llm_to_see_data=True",
+                        "text": "Can't summarize because the AI model doesn't have access to data",
                     }
                 )
 
