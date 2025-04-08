@@ -1,0 +1,557 @@
+question,content
+question,content
+What are the distinct error types from the errors table whose time intervals overlap with more than one state period?,"WITH overlapping_errors AS (
+    SELECT DISTINCT e.err
+    FROM table0 e
+    JOIN table1 t1 ON e.start_time BETWEEN t1.start_time AND t1.end_time
+    JOIN table1 t2 ON e.end_time BETWEEN t2.start_time AND t2.end_time
+    WHERE t1.id <> t2.id
+)
+SELECT err
+FROM overlapping_errors;"
+What are the distinct error types from the errors table whose time intervals overlap with more than one state period in the tab10 table?,"WITH overlapping_errors AS (
+    SELECT 
+        e.err, 
+        t1.state_description AS state1, 
+        t2.state_description AS state2, 
+        t3.state_description AS state3
+    FROM errors e
+    JOIN tab10 t1 ON e.start_time BETWEEN t1.start_time AND t1.end_time
+    JOIN tab10 t2 ON e.end_time BETWEEN t2.start_time AND t2.end_time
+    LEFT JOIN tab10 t3 ON e.start_time BETWEEN t3.start_time AND t3.end_time AND t3.id NOT IN (t1.id, t2.id)
+    WHERE t1.id <> t2.id
+)
+SELECT DISTINCT 
+    err, 
+    state1, 
+    state2, 
+    state3
+FROM overlapping_errors
+WHERE state3 IS NOT NULL
+UNION
+SELECT DISTINCT 
+    err, 
+    state1, 
+    state2, 
+    NULL AS state3
+FROM overlapping_errors
+WHERE state3 IS NULL;"
+What are the distinct error types from the errors table whose time intervals overlap with more than one state period in the tab10 table?,"WITH overlapping_errors AS (
+    SELECT DISTINCT 
+        e.err, 
+        t1.state_description AS state1, 
+        t2.state_description AS state2
+    FROM errors e
+    JOIN tab10 t1 ON e.start_time BETWEEN t1.start_time AND t1.end_time
+    JOIN tab10 t2 ON e.end_time BETWEEN t2.start_time AND t2.end_time
+    WHERE t1.id <> t2.id
+)
+SELECT 
+    err, 
+    state1, 
+    state2
+FROM overlapping_errors;"
+"For each state in the tab10 table, what are the distinct error types that occurred during that state’s time interval?","SELECT DISTINCT 
+    t.state_description, 
+    e.err
+FROM tab10 t
+JOIN errors e ON e.start_time BETWEEN t.start_time AND t.end_time
+ORDER BY t.state_description, e.err;"
+What are the distinct error types from the errors table whose time intervals overlap with more than one state period in the tab10 table?,"WITH overlapping_errors AS (
+    SELECT DISTINCT e.err
+    FROM errors e
+    JOIN tab10 t1 ON e.start_time BETWEEN t1.start_time AND t1.end_time
+    JOIN tab10 t2 ON e.end_time BETWEEN t2.start_time AND t2.end_time
+    WHERE t1.id <> t2.id
+)
+SELECT err
+FROM overlapping_errors;"
+Identify any errors from the errors table whose time intervals overlap with more than one state period in the tab10 table.,"SELECT e.*
+FROM errors e
+JOIN tab10 t1 ON e.start_time BETWEEN t1.start_time AND t1.end_time
+JOIN tab10 t2 ON e.end_time BETWEEN t2.start_time AND t2.end_time
+WHERE t1.id <> t2.id;"
+Which state periods in the tab10 table do not have any associated error records (i.e. no error’s start_time falls within the state’s time interval)?,"SELECT *
+FROM tab10
+WHERE start_time > (SELECT MIN(start_time) FROM errors)
+AND NOT EXISTS (
+    SELECT 1
+    FROM errors
+    WHERE errors.start_time BETWEEN tab10.start_time AND tab10.end_time
+);"
+Which state periods in the tab10 table do not have any associated error records (i.e. no error’s start_time falls within the state’s time interval)?,"SELECT t.start_time, t.end_time, t.state_description
+FROM tab10 t
+LEFT JOIN errors e ON e.start_time BETWEEN t.start_time AND t.end_time
+WHERE e.id IS NULL;"
+"For each state in the tab10 table, what is the average duration of errors that occurred during that state period?","WITH error_durations AS (
+    SELECT 
+        t.state_description, 
+        EXTRACT(EPOCH FROM (e.end_time - e.start_time)) / 60 AS error_duration_minutes
+    FROM errors e
+    JOIN tab10 t 
+    ON e.start_time BETWEEN t.start_time AND t.end_time
+)
+SELECT 
+    state_description, 
+    AVG(error_duration_minutes) AS avg_error_duration_minutes
+FROM error_durations
+GROUP BY state_description;"
+what are the top 5 errors that the most duration,"SELECT 
+    err, 
+    SUM(EXTRACT(EPOCH FROM (end_time - start_time)) / 60) AS total_duration_minutes
+FROM errors
+GROUP BY err
+ORDER BY total_duration_minutes DESC
+LIMIT 5;"
+What are the top 5 most frequent errors and the top 5 state descriptions in which these errors occur in tab10?,"WITH frequent_errors AS (
+    SELECT 
+        err, 
+        COUNT(*) AS error_count
+    FROM errors
+    GROUP BY err
+    ORDER BY error_count DESC
+    LIMIT 5
+),
+error_state_descriptions AS (
+    SELECT 
+        e.err, 
+        t.state_description, 
+        COUNT(*) AS state_count
+    FROM errors e
+    JOIN tab10 t ON e.start_time BETWEEN t.start_time AND t.end_time
+    WHERE e.err IN (SELECT err FROM frequent_errors)
+    GROUP BY e.err, t.state_description
+    ORDER BY state_count DESC
+)
+SELECT 
+    err, 
+    state_description, 
+    state_count
+FROM error_state_descriptions
+ORDER BY state_count DESC
+LIMIT 5;"
+how many parts where manufactured today?,"SELECT COUNT(*) 
+FROM table_states 
+WHERE state = '35' 
+  AND table_name = 'TAB10' 
+  AND start_time::DATE = CURRENT_DATE;"
+use table states to plot how the state changes in terms of start_time,"SELECT start_time, state
+FROM table_states
+ORDER BY start_time;"
+calculer le trs de chaque jour,"WITH filtered_data AS (
+    SELECT 
+        start_time::date AS day,
+        start_time,
+        end_time,
+        state_description,
+        EXTRACT(EPOCH FROM (end_time - start_time)) AS duration_seconds
+    FROM tab10
+    WHERE state_description IN ('Loading', 'Processing', 'Waiting', 'Welding', 'Unloading')
+      AND (start_time::timestamp)::time BETWEEN '08:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+),
+daily_medians AS (
+    SELECT 
+        day,
+        state_description,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS median_duration_seconds
+    FROM filtered_data
+    GROUP BY day, state_description
+),
+downtime_calculation AS (
+    SELECT 
+        fd.day,
+        SUM(CASE 
+                WHEN fd.duration_seconds > dm.median_duration_seconds 
+                THEN fd.duration_seconds - dm.median_duration_seconds 
+                ELSE 0 
+            END) - 60600 AS total_downtime
+    FROM filtered_data fd
+    JOIN daily_medians dm 
+    ON fd.day = dm.day AND fd.state_description = dm.state_description
+    GROUP BY fd.day
+),
+production_data AS (
+    SELECT 
+        start_time::date AS day,
+        COUNT(*) AS total_units_produced
+    FROM table_states
+    WHERE state = '35'
+      AND (start_time::timestamp)::time BETWEEN '07:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+    GROUP BY day
+),
+operating_time AS (
+    SELECT 
+        day,
+        28800 AS operating_time_seconds
+    FROM production_data
+),
+quality_data AS (
+    SELECT 
+        day,
+        total_units_produced AS good_units_produced
+    FROM production_data
+),
+trs_calculation AS (
+    SELECT 
+        ot.day,
+        ((ot.operating_time_seconds - dt.total_downtime) / ot.operating_time_seconds) AS availability,
+        ((pd.total_units_produced * 1100) / (ot.operating_time_seconds - dt.total_downtime)) AS productivity,
+        (qd.good_units_produced / pd.total_units_produced) AS quality,
+        ((ot.operating_time_seconds - dt.total_downtime) / ot.operating_time_seconds) *
+        ((pd.total_units_produced * 1100) / (ot.operating_time_seconds - dt.total_downtime)) *
+        (qd.good_units_produced / pd.total_units_produced) AS TRS
+    FROM operating_time ot
+    JOIN downtime_calculation dt ON ot.day = dt.day
+    JOIN production_data pd ON ot.day = pd.day
+    JOIN quality_data qd ON ot.day = qd.day
+)
+SELECT 
+    day,
+    TRS,
+    availability,
+    productivity,
+    quality
+FROM trs_calculation
+ORDER BY day;"
+calculer le trs de chaque jour,"WITH filtered_data AS (
+    SELECT 
+        start_time::date AS day,
+        start_time,
+        end_time,
+        state_description,
+        EXTRACT(EPOCH FROM (end_time - start_time)) AS duration_seconds
+    FROM tab10
+    WHERE state_description IN ('Loading', 'Processing', 'Waiting', 'Welding', 'Unloading')
+      AND (start_time::timestamp)::time BETWEEN '08:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+),
+daily_medians AS (
+    SELECT 
+        day,
+        state_description,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS median_duration_seconds
+    FROM filtered_data
+    GROUP BY day, state_description
+),
+downtime_calculation AS (
+    SELECT 
+        fd.day,
+        SUM(CASE 
+                WHEN fd.duration_seconds > dm.median_duration_seconds 
+                THEN fd.duration_seconds - dm.median_duration_seconds 
+                ELSE 0 
+            END) - 60600 AS total_downtime
+    FROM filtered_data fd
+    JOIN daily_medians dm 
+    ON fd.day = dm.day AND fd.state_description = dm.state_description
+    GROUP BY fd.day
+),
+production_data AS (
+    SELECT 
+        start_time::date AS day,
+        COUNT(*) AS total_units_produced
+    FROM table_states
+    WHERE state = '35'
+      AND (start_time::timestamp)::time BETWEEN '07:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+    GROUP BY day
+),
+operating_time AS (
+    SELECT 
+        day,
+        28800 AS operating_time_seconds
+    FROM production_data
+),
+quality_data AS (
+    SELECT 
+        day,
+        total_units_produced AS good_units_produced
+    FROM production_data
+),
+trs_calculation AS (
+    SELECT 
+        ot.day,
+        ((ot.operating_time_seconds - dt.total_downtime) / ot.operating_time_seconds) *
+        ((pd.total_units_produced * 1100) / (ot.operating_time_seconds - dt.total_downtime)) *
+        (qd.good_units_produced / pd.total_units_produced) AS TRS
+    FROM operating_time ot
+    JOIN downtime_calculation dt ON ot.day = dt.day
+    JOIN production_data pd ON ot.day = pd.day
+    JOIN quality_data qd ON ot.day = qd.day
+)
+SELECT 
+    day,
+    TRS
+FROM trs_calculation
+ORDER BY day;"
+"can calculate the TRS also known as OEE.","WITH filtered_data AS (
+    SELECT 
+        start_time::date AS day,
+        start_time,
+        end_time,
+        state_description,
+        EXTRACT(EPOCH FROM (end_time - start_time)) AS duration_seconds
+    FROM tab10
+    WHERE state_description IN ('Loading', 'Processing', 'Waiting', 'Welding', 'Unloading')
+      AND (start_time::timestamp)::time BETWEEN '08:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+),
+daily_medians AS (
+    SELECT 
+        day,
+        state_description,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS median_duration_seconds
+    FROM filtered_data
+    GROUP BY day, state_description
+),
+downtime_calculation AS (
+    SELECT 
+        fd.day,
+        SUM(CASE 
+                WHEN fd.duration_seconds > dm.median_duration_seconds 
+                THEN fd.duration_seconds - dm.median_duration_seconds 
+                ELSE 0 
+            END) - 60600 AS total_downtime
+    FROM filtered_data fd
+    JOIN daily_medians dm 
+    ON fd.day = dm.day AND fd.state_description = dm.state_description
+    GROUP BY fd.day
+),
+production_data AS (
+    SELECT 
+        start_time::date AS day,
+        COUNT(*) AS total_units_produced
+    FROM table_states
+    WHERE state = '35'
+      AND (start_time::timestamp)::time BETWEEN '07:00:00' AND '16:00:00'
+      AND start_time::date < CURRENT_DATE
+    GROUP BY day
+),
+operating_time AS (
+    SELECT 
+        day,
+        28800 AS operating_time_seconds
+    FROM production_data
+),
+quality_data AS (
+    SELECT 
+        day,
+        total_units_produced AS good_units_produced
+    FROM production_data
+),
+trs_calculation AS (
+    SELECT 
+        ot.day,
+        ((ot.operating_time_seconds - dt.total_downtime) / ot.operating_time_seconds) *
+        ((pd.total_units_produced * 1100) / (ot.operating_time_seconds - dt.total_downtime)) *
+        (qd.good_units_produced / pd.total_units_produced) AS TRS
+    FROM operating_time ot
+    JOIN downtime_calculation dt ON ot.day = dt.day
+    JOIN production_data pd ON ot.day = pd.day
+    JOIN quality_data qd ON ot.day = qd.day
+)
+SELECT 
+    day,
+    TRS
+FROM trs_calculation
+ORDER BY day;"
+give me last 10 days production report,"WITH production_data AS (
+    SELECT 
+        end_time::date AS production_date,
+        COUNT(*) AS units_produced 
+    FROM table_states 
+    WHERE state = '35' 
+    GROUP BY end_time::date
+    ORDER BY production_date DESC 
+    LIMIT 10
+)
+SELECT * FROM production_data;"
+HOW MUCH WE HAVE TODAY IN PRODUCTION,SELECT count(*) FROM table_states WHERE state = '35' AND table_name = 'TAB10' AND start_time >= CURRENT_DATE;
+temps  de cycle station 10,"WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35' AND table_name = 'TAB10'
+),
+cycle_durations AS (
+    SELECT 
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+)
+SELECT cycle_duration_minutes
+FROM cycle_durations;"
+"i want you to give me the cycles durations, after that i want you to give the percentage of each minutes in the duration so like if we have these duration [10.2,10.3,15.9,13.4] then the percentages will be {10:50%,15:25%, 13:25%}, take only the cycle durations that are below 30, you final answer should contain a column minutes and a column percentage of that minute.","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+),
+filtered_cycles AS (
+    SELECT 
+        ROUND(cycle_duration_minutes) AS minutes
+    FROM cycle_durations
+    WHERE cycle_duration_minutes < 30
+),
+minutes_count AS (
+    SELECT 
+        minutes, 
+        COUNT(*) AS count
+    FROM filtered_cycles
+    GROUP BY minutes
+),
+total_count AS (
+    SELECT 
+        SUM(count) AS total
+    FROM minutes_count
+)
+SELECT 
+    mc.minutes, 
+    ROUND((mc.count::numeric / tc.total) * 100, 2) AS percentage
+FROM minutes_count mc, total_count tc
+ORDER BY mc.minutes;"
+"what is the duration of each cycle in minutes(a cycle is from state 35 to the next one 35,36,...,35)","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        start_time AS cycle_start_time,
+        next_welding_start_time AS cycle_end_time,
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+)
+SELECT 
+    cycle_start_time, 
+    cycle_end_time, 
+    cycle_duration_minutes,
+    MAX(cycle_duration_minutes) OVER () AS max_duration,
+    MIN(cycle_duration_minutes) OVER () AS min_duration
+FROM cycle_durations
+WHERE cycle_duration_minutes < 30;"
+"what is the duration of each cycle in minutes(a cycle is from state 35 to the next one 35,36,...,35)","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        start_time AS cycle_start_time,
+        next_welding_start_time AS cycle_end_time,
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+)
+SELECT cycle_start_time, cycle_end_time, cycle_duration_minutes
+FROM cycle_durations;"
+"give me the the duration of each cycle in minutes, start_time of the cycle and end_time of the cycle(a cycle is from state 35 to the next one 35,36,...,35)","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        start_time AS cycle_start_time,
+        next_welding_start_time AS cycle_end_time,
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+)
+SELECT cycle_start_time, cycle_end_time, cycle_duration_minutes
+FROM cycle_durations;"
+"what is the duration of each cycle in minutes(a cycle is from state 35 to the next one 35,36,...,35)","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time,
+        start_time::date AS cycle_day
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        cycle_day,
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+    WHERE next_welding_start_time IS NOT NULL
+)
+SELECT cycle_day, cycle_duration_minutes
+FROM cycle_durations;"
+"what is the median duration of a cycle(from the first state 35 to the next one 35,36,...,35)?","WITH welding_states AS (
+    SELECT 
+        id, 
+        start_time, 
+        end_time, 
+        LEAD(start_time) OVER (ORDER BY start_time) AS next_welding_start_time
+    FROM table_states
+    WHERE state = '35'
+),
+cycle_durations AS (
+    SELECT 
+        EXTRACT(EPOCH FROM next_welding_start_time - end_time) / 60 AS cycle_duration_minutes
+    FROM welding_states
+)
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cycle_duration_minutes) AS median_cycle_duration_minutes
+FROM cycle_durations;"
+"give me the downtime of each state then Determine Production Data such that:  Define production as the count of records where state_description is 'Welding'. Count these records for each day, using a slightly broader time window (e.g., from 07:00:00 to 16:00:00), and again, exclude the current day. This gives you the total units produced per day.","WITH durations AS (SELECT start_time,state_description, EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 60 AS duration FROM tab10), median_durations as (select state_description, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration) AS median_duration from durations GROUP BY state_description), downtimes AS (SELECT d.start_time, d.state_description, CASE WHEN d.duration > m.median_duration THEN d.duration - m.median_duration ELSE 0 END AS downtime FROM durations d JOIN median_durations m on d.state_description = m.state_description), production_data AS (SELECT start_time::date AS production_date, COUNT(*) AS units_produced FROM tab10 WHERE state_description = 'Welding' AND (start_time::timestamp)::time >= '07:00:00' AND (start_time::timestamp)::time <= '16:00:00' GROUP BY start_time::Date) SELECT * FROM production_data;"
+quelle est la duree median de chaque state dans tab10 en minutes?,"WITH durations AS (SELECT state_description, EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 60 AS duration FROM tab10)
+SELECT state_description, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration) AS median_duration_minutes FROM durations GROUP BY state_description;"
+quelle est le downtime de chaque state dans tab10 en minutes dans la periode 2025-02-01 et 2025-02-03?,"WITH durations AS (
+                    SELECT start_time,state_description, EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 60 AS duration 
+                    FROM tab10),
+                    median_durations as (select state_description, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration) AS median_duration from durations GROUP BY state_description)
+                    ,downtimes AS (
+                      SELECT 
+                        d.start_time,
+                        d.state_description,
+                        CASE 
+                          WHEN d.duration > m.median_duration THEN d.duration - m.median_duration
+                          ELSE 0
+                        END AS downtime
+                      FROM durations d
+                      JOIN median_durations m on
+                        d.state_description = m.state_description
+                    )
+                    select * from downtimes;"
+quelle est la duree median de chaque state dans tab10,"WITH durations AS (SELECT state_description, EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 60 AS duration FROM tab10) select state_description, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration) AS median_duration_seconds from durations GROUP BY state_description;"
+how many parts were manifactured during february 2025?,"SELECT count(*) FROM table_states WHERE state = '35' AND table_name = 'TAB10' AND date_part('month',end_time::timestamp) = '02' AND date_part('year',end_time::timestamp) = '2025';"
+how many parts were manifactured in the period 2025-02-01 to 2025-02-11?,SELECT count(*) FROM table_states WHERE state = '35' AND table_name = 'TAB10' AND start_time >= '2025-02-01' AND end_time <= '2025-02-11';
+combien de fois state Unloading est repeter dans tab03 dans la period 2025-02-01 et 2025-02-05?,SELECT COUNT(*) FROM tab03 WHERE state_description = 'Unloading' AND start_time >= '2025-02-01' AND end_time <= '2025-02-05'
+donner moi 10 exemples de duree de welding dans tab10?,WITH durations AS (SELECT EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 3600 AS duration FROM tab10 WHERE state_description = 'Welding') SELECT * FROM durations LIMIT 10;
+quelle est la duree total d'execution de state loading en minutes dans la period 2025-01-29 08:11:00 et 2025-01-29 15:29:00 pour tab07 ?,SELECT SUM(EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp)) / 3600 AS period FROM tab07 WHERE state_description = 'Loading' AND start_time >= '2025-01-29 08:11:00' AND end_time <= '2025-01-29 15:29:00';
+quelle est la duree moyenne d'execution de state loading en minutes?,SELECT AVG(EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp)) / 60 AS period FROM tab10 WHERE state_description = 'Loading';
+quelle est la duree median de state welding en minutes pour tab10?,"WITH durations AS (SELECT EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp) / 60 AS duration FROM tab10 WHERE state_description = 'Welding')
+select PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration) AS median_duration_seconds from durations;"
+combien de fois state 35 est repeter dans la period 2025-02-01 et 2025-02-05?,SELECT COUNT(*) FROM table_states WHERE state = '35' AND start_time >= '2025-02-01' AND end_time <= '2025-02-05'
+What is the average duration of execution of state 10 between the period 2025-02-01 to 2025-02-05 in hours?,SELECT AVG(EXTRACT(EPOCH FROM end_time::timestamp - start_time::timestamp)) /60  AS period FROM table_states WHERE start_time >= '2025-02-01' AND end_time <= '2025-02-05' and state = '10';
+What is the total number of states within the period 2025-03-01 to 2025-03-07?,SELECT COUNT(DISTINCT state) FROM table_states WHERE start_time >= '2025-03-01' AND end_time <= '2025-03-07'
+How many times does state 35 repeat within the period 2025-02-01 to 2025-02-05?,SELECT COUNT(*) FROM table_states WHERE state = 35 AND start_time >= '2025-02-01' AND end_time <= '2025-02-05'
