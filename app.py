@@ -23,15 +23,24 @@ class BaseApp(ChromaDB_VectorStore, OpenAI_Chat):
 
 
 base_app = BaseApp(config={
-    'model': 'deepseek/deepseek-chat-v3-0324:free',
+    'model': 'deepseek/deepseek-chat-v3:free',
     "path": chromadb_path,
     "client": "persistent",
     "temperature": 0.3,
     "language": "French"
 })
 
-base_app.connect_to_database(host='192.168.7.236', dbname='iot2050db', user='iot2050', password='iot2050iot',
-                             port='5432')
+try:
+    base_app.connect_to_database(host='192.168.7.236', dbname='iot2050db', user='iot2050', password='iot2050iot',
+                                 port='5432')
+except:
+    db_host = '127.0.0.1'
+    db_port = 5432
+    db_user = 'gmd'
+    db_password = '1234'
+    db_name = 'gmd_iot'
+    base_app.connect_to_database(host=db_host, dbname=db_name, user=db_user, password=db_password,
+                                 port='5432')
 
 
 def init_vector_db(base_app, include_examples=True):
@@ -69,6 +78,8 @@ app = FlaskApp(base_app, allow_llm_to_see_data=True, debug=True,
                title='GMD Copilot', summarization=True, ask_results_correct=True,
                subtitle='Your AI-powered copilot for extracting insights from Data.',
                show_training_data=False, sql=False, max_attempts=5,
-               app_secret_key=app_secret_key)
+               app_secret_key=app_secret_key,
+               index_html_path="index.html"
+               )
 if __name__ == "__main__":
     app.run()

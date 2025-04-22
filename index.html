@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Insights Chatbot</title>
+    <link rel="stylesheet" href="css/main.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link rel="stylesheet" href="css/layout.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <div id="auth-container" class="auth-container">
+            <!-- Auth content will be loaded here -->
+        </div>
+        <div id="dashboard-container" class="dashboard-container hidden">
+            <!-- Dashboard content will be loaded here -->
+        </div>
+    </div>
+
+    <script src="js/config.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/auth.js"></script>
+    <script src="js/fileManager.js"></script>
+    <script src="js/sqlGenerator.js"></script>
+    <script src="js/dataVisualizer.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

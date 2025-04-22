@@ -22,4 +22,6 @@ werkzeug
 flask-sock
 
 # ChromaDB vector store integration
-chromadb
+chromadb==0.6.3
+
+tabulate
