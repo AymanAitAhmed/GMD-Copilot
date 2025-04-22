@@ -79,7 +79,6 @@ app = FlaskApp(base_app, allow_llm_to_see_data=True, debug=True,
                subtitle='Your AI-powered copilot for extracting insights from Data.',
                show_training_data=False, sql=False, max_attempts=5,
                app_secret_key=app_secret_key,
-               index_html_path="index.html"
                )
 if __name__ == "__main__":
     app.run()
