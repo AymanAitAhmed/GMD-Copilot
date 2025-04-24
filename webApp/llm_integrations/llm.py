@@ -26,14 +26,48 @@ class OpenAI_Chat(CopilotBase):
         if "api_key" in config:
             self.client = OpenAI(api_key=config["api_key"])
 
-    def system_message(self, message: str) -> any:
+    def system_message(self, message: str = "") -> any:
         return {"role": "system", "content": message}
 
-    def user_message(self, message: str) -> any:
+    def user_message(self, message: str = "") -> any:
         return {"role": "user", "content": message}
 
-    def assistant_message(self, message: str) -> any:
+    def assistant_message(self, message: str = "", function_call: dict = None) -> any:
+        if function_call is not None:
+            return {"role": "assistant", "function_call": function_call}
         return {"role": "assistant", "content": message}
+
+    def tool_definition(self, tool_name: str, tool_description: str, properties: dict, required: list) -> dict:
+        """
+        Build an OpenAI-style function (tool) definition.
+
+        :param tool_name: name of the tool/function
+        :param tool_description: human-friendly description of what the tool does
+        :param properties: dict mapping parameter names to their JSON schema definitions
+        :param required: list of parameter names that are required
+        :return: a dict suitable for inclusion in the `tools` list
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False
+                }
+            }
+        }
+
+    def tool_message(self, name, call_id, tool_out) -> any:
+        return {
+            "role": "tool",
+            "name": name,
+            "tool_call_id": call_id,
+            "content": tool_out
+        }
 
     def submit_prompt(self, prompt, **kwargs) -> str:
         # Validate prompt

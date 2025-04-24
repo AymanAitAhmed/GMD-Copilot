@@ -907,7 +907,7 @@ class FlaskAPI:
                       type: object
             """
             df = copilot.get_training_data()
-
+            copilot.get_tables_to_use()
             if df is None or len(df) == 0:
                 return jsonify(
                     {
@@ -957,6 +957,18 @@ class FlaskAPI:
                 return jsonify(
                     {"type": "error", "error": "Couldn't remove training data"}
                 )
+
+
+        @self.flask_app.route("/run_agent", methods= ["POST"])
+        def run_agent_endpoint():
+            data = request.get_json()
+            question = data.get("question")
+            if not question:
+                return jsonify({"error": "Missing 'question' in request body."}), 400
+
+            sql_or_clarification = copilot.run_sql_agent(question)
+            return jsonify({"success": sql_or_clarification})
+
 
         @self.flask_app.route("/api/v0/train", methods=["POST"])
         @self.requires_auth
@@ -1443,3 +1455,6 @@ class FlaskApp(FlaskAPI):
             response = make_response(html_content)
             response.set_cookie('session_id', generated_session_id)
             return response
+
+    def test(self, ):
+        return self.get_related_ddl("test")

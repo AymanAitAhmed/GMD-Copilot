@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import List, Tuple, Union
 from urllib.parse import urlparse
 import markdown
+import ast
 
 import pandas as pd
 import duckdb
@@ -18,7 +19,6 @@ import sqlparse
 
 from .exceptions import ImproperlyConfigured, ValidationError
 from .training_plan import TrainingPlan, TrainingPlanItem
-
 
 
 class CopilotBase(ABC):
@@ -43,6 +43,133 @@ class CopilotBase(ABC):
 
         return f"You must Respond {self.language} language."
 
+    def get_table_schemas(self,):
+        ddl = self.con.sql(
+            "SELECT table_name,column_name, data_type"
+            " FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'"
+        ).df()
+
+        cols = (
+            ddl.groupby("table_name")["column_name"]
+            .apply(list)
+            .to_dict()
+        )
+        return {"table_columns": cols}
+
+    def get_user_clarification(self, question: str) -> dict:
+        """
+        When invoked, returns a JSON dict containing the clarification question
+        that should be posed back to the user.
+        """
+        return {"clarification": question}
+
+    def get_few_shot_and_docs(self, question: str, kwargs: dict = None) -> dict:
+        """
+        Query the RAG store: return similar question-SQL pairs and related docs.
+        """
+        question_sql_list = self.get_similar_question_sql(question, **(kwargs or {}))
+        doc_list = self.get_related_documentation(question, **(kwargs or {}))
+        return {"examples": question_sql_list, "docs": doc_list}
+
+    # — Agent loop —
+    def run_sql_agent(self, user_question: str) -> str:
+        """
+        Main entry point: given a natural-language question, runs an agentic
+        workflow that may call our tools, then returns either a clarification
+        prompt or the final SQL string.
+        """
+        # Initial messages
+
+        messages = [ self.system_message((
+                    "You are a DuckDB expert agent. "
+                    "You may call get_table_schemas to inspect the schema,"
+                    "get_user_clarification to ask the user for more details, or"
+                    "get_few_shot_and_docs to get the needed information."
+                    "Dont you ever answer the question without looking at the schemas and related documentation first."
+                    "Once you have enough context, generate a DuckDB-compatible SQL query"
+                    "to answer the user's question, without any extra explanation."
+                )),
+            self.user_message(user_question)
+        ]
+        while True:
+            # 1) Ask the model what to do
+            from openai import OpenAI
+            api_key = "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"
+            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1/")
+            tools = [
+                self.tool_definition(
+                    tool_name="get_table_schemas",
+                    tool_description="Return a list of tables, each with its columns and data types",
+                    properties={},
+                    required=[]
+                ),
+                self.tool_definition(
+                    tool_name="get_user_clarification",
+                    tool_description="Generate a clarification question when the user request is ambiguous",
+                    properties={
+                        "question": {"type": "string", "description": "The user question needing clarification"}
+                    },
+                    required=["question"]
+                ),
+                self.tool_definition(
+                    tool_name="get_few_shot_and_docs",
+                    tool_description="Retrieve similar example SQL queries with their proper question and related documentation for the user's question from a RAG DB",
+                    properties={
+                        "question": {"type": "string", "description": "The user's original question"},
+                        "kwargs": {"type": "object",
+                                   "description": "Optional parameters for similarity search and documentation retrieval"}
+                    },
+                    required=["question"]
+                )
+
+            ]
+            print("asking the model")
+            resp = client.chat.completions.create(
+                model="deepseek-r1-distill-llama-70b",
+                messages=messages,
+                tools=tools
+            )
+            msg = resp.choices[0].message
+            print("msg returned: ",msg)
+
+            # 2) If the model wants to call a tool…
+            if msg.tool_calls:
+                call = msg.tool_calls[0]
+                name = call.function.name
+                args = ast.literal_eval(call.function.arguments) or {}
+
+                print(f"model called {name} tool")
+                print(f"the args returned are: {args}")
+
+                # 3) Execute the matching Python function
+                if name == "get_table_schemas":
+                    tool_out = self.get_table_schemas()
+                elif name == "get_user_clarification":
+                    tool_out = self.get_user_clarification(args["question"])
+                elif name == "get_few_shot_and_docs":
+                    tool_out = get_few_shot_and_docs(args["question"])
+                else:
+                    raise RuntimeError(f"Unknown tool: {name}")
+
+                print(f"got this as a result {tool_out}")
+                # 4) Append assistant's tool call and the tool result
+                messages.append(self.assistant_message(function_call = {"name": name, "arguments": str(args)}))
+                messages.append(self.tool_message(name, call.id, str(tool_out)))
+
+                # 5) If it was a clarification call, immediately return that question
+                if name == "get_user_clarification":
+                    return str(tool_out["clarification"])
+                continue
+
+            # 6) No tool call → this is the final answer (SQL)
+            final_response = msg.content or ""
+            sql = self.extract_sql(final_response)
+            if sql:
+                return sql
+            # ask again for valid SQL
+            messages.append({"role": "user",
+                             "content": "I didn’t detect a valid SQL query—please provide only the SQL statement ending with a semicolon."})
+
     def generate_sql(self, question: str, allow_llm_to_see_data=False, **kwargs) -> str:
         """
         Uses the LLM to generate a SQL query that answers a question. It runs the following methods:
@@ -61,8 +188,8 @@ class CopilotBase(ABC):
 
         dfs_uploaded = kwargs.pop('dfs', None)
         question_sql_list = self.get_similar_question_sql(question, **kwargs)
-        ddl_list = self.get_related_ddl(question, **kwargs)
         doc_list = self.get_related_documentation(question, **kwargs)
+        ddl_list = self.get_related_ddl(question, **kwargs)
         prompt = self.get_sql_prompt(
             initial_prompt=initial_prompt,
             question=question,
@@ -497,7 +624,15 @@ class CopilotBase(ABC):
         pass
 
     @abstractmethod
-    def assistant_message(self, message: str) -> any:
+    def assistant_message(self, message: str, function_call: dict) -> any:
+        pass
+
+    @abstractmethod
+    def tool_definition(self, tool_name: str, tool_description: str, properties: dict, required: list) -> dict:
+        pass
+
+    @abstractmethod
+    def tool_message(self,name,call_id,tool_out) -> any:
         pass
 
     def str_to_approx_token_count(self, string: str) -> int:
@@ -834,7 +969,6 @@ if len(unique_values) == 1:
 
         attach_str = f"hostaddr={host} dbname={dbname} user={user} password={password} port={port}"
         try:
-            # The alias 'pg' is used for the attached PostgreSQL database.
             self.con.sql(f"ATTACH '{attach_str}' AS pg (TYPE postgres, SCHEMA 'public');")
         except Exception as e:
             raise ValidationError(f"Failed to attach PostgreSQL database: {e}")

@@ -8,6 +8,7 @@ from webApp.my_chromadb.chromadb import ChromaDB_VectorStore
 from FlaskApp import FlaskApp
 from constants import *
 
+
 open_router = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
 
 
@@ -27,7 +28,8 @@ base_app = BaseApp(config={
     "path": chromadb_path,
     "client": "persistent",
     "temperature": 0.3,
-    "language": "French"
+    "language": "French",
+    "n_results_sql": 6
 })
 
 try:
@@ -50,7 +52,7 @@ def init_vector_db(base_app, include_examples=True):
         for id in documentation_ids:
             base_app.remove_training_data(id=id)
 
-    df_information_schema = base_app.run_sql("SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'")
+    df_information_schema = base_app.run_sql("SELECT table_name,column_name, data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'")
 
     plan = base_app.get_training_plan_generic(df_information_schema)
     base_app.train(plan=plan)
@@ -79,6 +81,7 @@ app = FlaskApp(base_app, allow_llm_to_see_data=True, debug=True,
                subtitle='Your AI-powered copilot for extracting insights from Data.',
                show_training_data=False, sql=False, max_attempts=5,
                app_secret_key=app_secret_key,
+               # index_html_path="index.html"
                )
 if __name__ == "__main__":
     app.run()
