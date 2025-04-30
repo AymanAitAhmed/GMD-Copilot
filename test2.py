@@ -8,7 +8,7 @@ def call_run_agent(server_url: str, question: str):
     url = f"{server_url.rstrip('/')}/run_agent"
     payload = {"question": question}
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=60)
         r.raise_for_status()
     except requests.RequestException as e:
         print("Request failed:", e)
@@ -22,4 +22,4 @@ def call_run_agent(server_url: str, question: str):
 
 if __name__ == "__main__":
     # adjust host/port as needed
-    call_run_agent("http://127.0.0.1:8084", "How many parts were manufactured each day of W10?")
+    call_run_agent("http://127.0.0.1:8084", "would say we are able to make 2000 bentos in one year?")

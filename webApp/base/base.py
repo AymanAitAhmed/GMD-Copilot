@@ -7,6 +7,7 @@ from typing import List, Tuple, Union
 from urllib.parse import urlparse
 import markdown
 import ast
+import pprint
 
 import pandas as pd
 import duckdb
@@ -43,25 +44,39 @@ class CopilotBase(ABC):
 
         return f"You must Respond {self.language} language."
 
-    def get_table_schemas(self,):
+    def get_table_schemas(self, ):
+        """
+         Returns JSON-compatible dict:
+         {"tables": [
+             {"table": "tab10", "columns": [{"name":"col1","type":"VARCHAR"},...],
+              "sample_rows": [ {col: val,...}, ... up to 5 rows ]
+             },
+             ...
+         ]}
+         """
+        # fetch schema info
         ddl = self.con.sql(
-            "SELECT table_name,column_name, data_type"
+            "SELECT table_name, column_name, data_type"
             " FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'"
         ).df()
 
-        cols = (
-            ddl.groupby("table_name")["column_name"]
-            .apply(list)
-            .to_dict()
-        )
-        return {"table_columns": cols}
+        tables = []
+        for table, group in ddl.groupby("table_name"):
+            # columns
+            cols = [{"name": row["column_name"], "type": row["data_type"]} for _, row in group.iterrows()]
+            # sample rows
+            sample_df = self.con.sql(f"SELECT * FROM {table} LIMIT 5").df()
+            sample = sample_df.to_dict(orient="records")
+            tables.append({"table": table, "columns": cols, "sample_rows": sample})
 
-    def get_user_clarification(self, question: str) -> dict:
+        return {"tables": tables}
+
+    def get_user_clarification(self, clarification_questions: str) -> dict:
         """
         When invoked, returns a JSON dict containing the clarification question
         that should be posed back to the user.
         """
-        return {"clarification": question}
+        return {"clarification": clarification_questions}
 
     def get_few_shot_and_docs(self, question: str, kwargs: dict = None) -> dict:
         """
@@ -71,8 +86,7 @@ class CopilotBase(ABC):
         doc_list = self.get_related_documentation(question, **(kwargs or {}))
         return {"examples": question_sql_list, "docs": doc_list}
 
-    # — Agent loop —
-    def run_sql_agent(self, user_question: str) -> str:
+    def run_sql_agent(self, user_question: str) -> any:
         """
         Main entry point: given a natural-language question, runs an agentic
         workflow that may call our tools, then returns either a clarification
@@ -80,57 +94,63 @@ class CopilotBase(ABC):
         """
         # Initial messages
 
-        messages = [ self.system_message((
-                    "You are a DuckDB expert agent. "
-                    "You may call get_table_schemas to inspect the schema,"
-                    "get_user_clarification to ask the user for more details, or"
-                    "get_few_shot_and_docs to get the needed information."
-                    "Dont you ever answer the question without looking at the schemas and related documentation first."
-                    "Once you have enough context, generate a DuckDB-compatible SQL query"
-                    "to answer the user's question, without any extra explanation."
-                )),
+        messages = [self.system_message(message=(
+            "You are a DuckDB expert agent. Follow this decision process:"
+            "1. If the user's request is unclear or missing context, call get_user_clarification."
+            "2. Use get_few_shot_and_docs to gather similar SQL examples and relevant documentation."
+            "3. Inspect schema by calling get_table_schemas."
+            "4. With all context, produce ONLY the final DuckDB SQL query."
+        )),
             self.user_message(user_question)
         ]
-        while True:
-            # 1) Ask the model what to do
-            from openai import OpenAI
-            api_key = "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"
-            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1/")
-            tools = [
-                self.tool_definition(
-                    tool_name="get_table_schemas",
-                    tool_description="Return a list of tables, each with its columns and data types",
-                    properties={},
-                    required=[]
-                ),
-                self.tool_definition(
-                    tool_name="get_user_clarification",
-                    tool_description="Generate a clarification question when the user request is ambiguous",
-                    properties={
-                        "question": {"type": "string", "description": "The user question needing clarification"}
-                    },
-                    required=["question"]
-                ),
-                self.tool_definition(
-                    tool_name="get_few_shot_and_docs",
-                    tool_description="Retrieve similar example SQL queries with their proper question and related documentation for the user's question from a RAG DB",
-                    properties={
-                        "question": {"type": "string", "description": "The user's original question"},
-                        "kwargs": {"type": "object",
-                                   "description": "Optional parameters for similarity search and documentation retrieval"}
-                    },
-                    required=["question"]
-                )
+        fs = self.get_few_shot_and_docs(user_question)
+        messages.append({"role": "assistant",
+                         "function_call": {"name": "get_few_shot_and_docs", "arguments": str({"question": user_question})}})
+        messages.append({"role": "tool", "name": "get_few_shot_and_docs", "tool_call_id": "fs1", "content": str(fs)})
+        # call get_table_schemas
+        sch = self.get_table_schemas()
+        messages.append({"role": "assistant", "function_call": {"name": "get_table_schemas", "arguments": str({})}})
+        messages.append({"role": "tool", "name": "get_table_schemas", "tool_call_id": "sch1", "content": str(sch)})
+        from openai import OpenAI
+        api_key = "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"
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1/")
+        tools = [
+            self.tool_definition(
+                tool_name="get_table_schemas",
+                tool_description="Return a list of tables available to query, each with its columns and data types and a 5 row sample of the data, it should be used when you are ready to build the SQL query and you need the information about the tables to query, dont use it unless the question is clear.",
+                properties={},
+                required=[]
+            ),
+            self.tool_definition(
+                tool_name="get_user_clarification",
+                tool_description="This tool is used to ask the user for further clarification, it should be used when the initial question is ambiguous, it has one parameter 'clarification_question' which you should provide to ask it to the user, example: user: 'what is the trs of today', clarification_question: 'can define what does the TRS stand for?'",
+                properties={
+                    "clarification_questions": {"type": "string", "description": "The questions to ask the user so he can provide more clarification"}
+                },
+                required=["clarification_questions"]
+            ),
+            self.tool_definition(
+                tool_name="get_few_shot_and_docs",
+                tool_description="Retrieve similar example SQL queries with their proper question and related documentation for the user's question from a RAG DB, it should be used when you need further context.",
+                properties={
+                    "question": {"type": "string", "description": "The user's original question"},
+                    "kwargs": {"type": "object",
+                               "description": "Optional parameters for similarity search and documentation retrieval"}
+                },
+                required=["question"]
+            )
 
-            ]
+        ]
+        while True:
             print("asking the model")
             resp = client.chat.completions.create(
-                model="deepseek-r1-distill-llama-70b",
+                model="qwen-qwq-32b",
                 messages=messages,
-                tools=tools
+                tools=tools,
             )
             msg = resp.choices[0].message
-            print("msg returned: ",msg)
+            print("msg returned: ")
+            pprint.pprint(msg)
 
             # 2) If the model wants to call a tool…
             if msg.tool_calls:
@@ -145,30 +165,36 @@ class CopilotBase(ABC):
                 if name == "get_table_schemas":
                     tool_out = self.get_table_schemas()
                 elif name == "get_user_clarification":
-                    tool_out = self.get_user_clarification(args["question"])
+                    tool_out = self.get_user_clarification(args["clarification_questions"])
                 elif name == "get_few_shot_and_docs":
-                    tool_out = get_few_shot_and_docs(args["question"])
+                    tool_out = self.get_few_shot_and_docs(args["question"])
                 else:
                     raise RuntimeError(f"Unknown tool: {name}")
 
-                print(f"got this as a result {tool_out}")
+                print("got this as a result")
+                pprint.pprint(tool_out)
                 # 4) Append assistant's tool call and the tool result
-                messages.append(self.assistant_message(function_call = {"name": name, "arguments": str(args)}))
+                messages.append(self.assistant_message(function_call={"name": name, "arguments": str(args)}))
                 messages.append(self.tool_message(name, call.id, str(tool_out)))
 
                 # 5) If it was a clarification call, immediately return that question
                 if name == "get_user_clarification":
                     return str(tool_out["clarification"])
+
+                final_response = msg.content or ""
+                sql = self.extract_sql(final_response)
+                if not sql == "":
+                    try:
+                        return self.con.sql(query=sql).df()
+                    except Exception as e:
+                        print(f"the model encountred an error {e} and it will try to fix it")
+                        messages.append(self.user_message(f"i executed the sql query and got this error:```{e}```"))
+
                 continue
 
-            # 6) No tool call → this is the final answer (SQL)
-            final_response = msg.content or ""
-            sql = self.extract_sql(final_response)
-            if sql:
-                return sql
+
             # ask again for valid SQL
-            messages.append({"role": "user",
-                             "content": "I didn’t detect a valid SQL query—please provide only the SQL statement ending with a semicolon."})
+            messages.append(self.user_message("I didn’t detect a valid SQL query—please provide only the SQL statement ending with a semicolon."))
 
     def generate_sql(self, question: str, allow_llm_to_see_data=False, **kwargs) -> str:
         """
@@ -272,7 +298,7 @@ class CopilotBase(ABC):
             self.log(title="Extracted SQL", message=f"{sql}")
             return sql
 
-        return llm_response
+        return ""
 
     def fix_sql_case(self, sql: str) -> str:
         """
@@ -628,11 +654,11 @@ class CopilotBase(ABC):
         pass
 
     @abstractmethod
-    def tool_definition(self, tool_name: str, tool_description: str, properties: dict, required: list) -> dict:
+    def tool_message(self, name, call_id, tool_out) -> any:
         pass
 
     @abstractmethod
-    def tool_message(self,name,call_id,tool_out) -> any:
+    def use_agentic_mode(self, user_question):
         pass
 
     def str_to_approx_token_count(self, string: str) -> int:
@@ -1003,6 +1029,7 @@ if len(unique_values) == 1:
         Returns:
             pd.DataFrame: The results of the SQL query.
         """
+
         raise Exception(
             "You need to connect to a database first by running CopilotBase.connect_to_database()"
         )

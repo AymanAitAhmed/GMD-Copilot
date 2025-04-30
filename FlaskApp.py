@@ -960,13 +960,13 @@ class FlaskAPI:
 
 
         @self.flask_app.route("/run_agent", methods= ["POST"])
-        def run_agent_endpoint():
+        def run_agent_endpoint()-> any:
             data = request.get_json()
             question = data.get("question")
             if not question:
                 return jsonify({"error": "Missing 'question' in request body."}), 400
 
-            sql_or_clarification = copilot.run_sql_agent(question)
+            sql_or_clarification = copilot.use_agentic_mode(question)
             return jsonify({"success": sql_or_clarification})
 
 
