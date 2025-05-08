@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 import markdown
 import ast
 import pprint
+import sqlite3
+import datetime
+import threading
 
 import pandas as pd
 import duckdb
@@ -21,6 +24,9 @@ import sqlparse
 from .exceptions import ImproperlyConfigured, ValidationError
 from .training_plan import TrainingPlan, TrainingPlanItem
 
+CONVERSATION_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\conversations.db"
+thread_local = threading.local()
+
 
 class CopilotBase(ABC):
     def __init__(self, config=None):
@@ -33,7 +39,6 @@ class CopilotBase(ABC):
         self.dialect = self.config.get("dialect", "SQL")
         self.language = self.config.get("language", None)
         self.max_tokens = self.config.get("max_tokens", 14000)
-        self.duckdb_con = duckdb.connect(':memory:')
 
     def log(self, message: str, title: str = "Info"):
         print(f"{title}: {message}")
@@ -43,6 +48,174 @@ class CopilotBase(ABC):
             return ""
 
         return f"You must Respond {self.language} language."
+
+    # ----database related----
+
+    # def _initialize_database(self):
+    #     """Initializes the SQLite database connection and creates the table if needed."""
+    #     try:
+    #         self.conn = sqlite3.connect(self.db_path)
+    #         self.cursor = self.conn.cursor()
+    #         self.cursor.execute("""
+    #              CREATE TABLE IF NOT EXISTS message_history (
+    #                  timestamp DATETIME NOT NULL,
+    #                  conversation_id TEXT PRIMARY KEY NOT NULL,
+    #                  user_id TEXT NOT NULL,
+    #                  role TEXT NOT NULL,
+    #                  content TEXT NOT NULL,
+    #                  tool_call_id TEXT, -- Optional: For linking tool requests and responses
+    #                  tool_name TEXT     -- Optional: Name of the tool called/responded
+    #              )
+    #          """)
+    #         self.conn.commit()
+    #         print(f"Database initialized successfully at {self.db_path}")
+    #     except sqlite3.Error as e:
+    #         print(f"Database error during initialization: {e}")
+    #         # Potentially raise the error or handle it more gracefully
+    #         if self.conn:
+    #             self.conn.close()
+    #
+    # def close_db(self):
+    #     """Closes the database connection."""
+    #     if self.conn:
+    #         self.conn.close()
+    #         print("Database connection closed.")
+
+    def get_connection(self, db_path=CONVERSATION_DB_PATH):
+        conn = getattr(thread_local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS message_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    tool_call_id TEXT,
+                    tool_name TEXT,
+                    extracted_sql TEXT,
+                    reasoning TEXT
+                );
+            ''')
+            conn.commit()
+            thread_local.conn = conn
+        return conn
+
+    def insert_message_db(self, conversation_id, user_id, role, content=None, tool_call_id=None, tool_name=None,
+                          extracted_sql=None, reasoning=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
+        cursor.execute(
+            """INSERT INTO message_history (timestamp,conversation_id,user_id,role,content,tool_call_id,tool_name,extracted_sql,reasoning)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (timestamp, conversation_id, user_id, role, content, tool_call_id, tool_name, extracted_sql, reasoning)
+        )
+        conn.commit()
+        cursor.close()
+
+    def get_conversation_history(self, user_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT conversation_id, timestamp, role, content, tool_call_id, tool_name, extracted_sql, reasoning"
+            " FROM message_history ORDER BY timestamp"
+        )
+        rows = cursor.fetchall()
+
+        convos = {}
+        for conv_id, ts, role, content, tool_call_id, tool_name, extracted_sql, reasoning in rows:
+            if conv_id not in convos:
+                convos[conv_id] = {
+                    'id': conv_id,
+                    'createdAt': ts,
+                    'name': f"conversation {conv_id}",
+                    'messages': []
+                }
+            msg = {'role': role, 'text': content, 'timestamp': ts}
+            # Attach SQL and reasoning if present
+            if role == 'assistant':
+                if extracted_sql:
+                    msg['sql'] = extracted_sql
+                if reasoning:
+                    msg['reasoning'] = reasoning
+            convos[conv_id]['messages'].append(msg)
+
+        cursor.close()
+        return list(convos.values())
+
+    def get_conversation_by_id(self, user_id, conversation_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT DISTINCT user_id FROM message_history WHERE conversation_id = ?",
+            (str(conversation_id),)
+        )
+        row = cursor.fetchone()
+        if not row or row[0] is None:
+            raise ValueError(f"Conversation '{conversation_id}' not found.")
+
+        cursor.execute(
+            "SELECT timestamp, role, content, tool_call_id, tool_name, extracted_sql, reasoning"
+            " FROM message_history WHERE conversation_id = ? ORDER BY timestamp",
+            (conversation_id,)
+        )
+        rows = cursor.fetchall()
+
+        user_question = None
+        assistant_sql = None
+        assistant_reasoning = None
+        assistant_content = None
+        query_id = None
+        print(rows[-1])
+        for ts, role, content, tool_call_id, tool_name, extracted_sql, reasoning in rows:
+            print(f"////////////////{role}\n", content)
+            if role == 'user' and user_question is None:
+                user_question = content
+            elif role == 'assistant':
+                # Prefer stored extracted_sql
+                assistant_content = content
+                if extracted_sql:
+                    assistant_sql = extracted_sql
+                    assistant_reasoning = reasoning
+                    query_id = tool_call_id
+                # Fallback: detect SQL in content by simple pattern
+                if assistant_sql is None and content and content.strip().endswith(';'):
+                    assistant_sql = content.strip()
+
+        response_item = {
+            "id": conversation_id,
+            "threadId": conversation_id,
+            "question": user_question,
+            "sql": assistant_sql,
+            "view": None,
+            "breakdownDetail": None,
+            "answerDetail": {
+                "queryId": query_id,
+                "status": "FINISHED",
+                "content": assistant_content,
+                "reasoning": assistant_reasoning,
+                "numRowsUsedInLLM": 1,
+                "error": None,
+                "__typename": "ThreadResponseAnswerDetail"
+            },
+            "chartDetail": None,
+            "askingTask": None,
+            "adjustment": None,
+            "adjustmentTask": None,
+            "__typename": "ThreadResponse"
+        }
+
+        thread_data = {
+            "id": conversation_id,
+            "responses": [response_item] if user_question else [],
+            "__typename": "DetailedThread"
+        }
+        cursor.close()
+        return {"data": {"thread": thread_data}}
 
     def get_table_schemas(self, ):
         """
@@ -86,115 +259,20 @@ class CopilotBase(ABC):
         doc_list = self.get_related_documentation(question, **(kwargs or {}))
         return {"examples": question_sql_list, "docs": doc_list}
 
-    def run_sql_agent(self, user_question: str) -> any:
-        """
-        Main entry point: given a natural-language question, runs an agentic
-        workflow that may call our tools, then returns either a clarification
-        prompt or the final SQL string.
-        """
-        # Initial messages
+    def execute_sql(self, sql):
+        extracted_sql = self.extract_sql(sql)
 
-        messages = [self.system_message(message=(
-            "You are a DuckDB expert agent. Follow this decision process:"
-            "1. If the user's request is unclear or missing context, call get_user_clarification."
-            "2. Use get_few_shot_and_docs to gather similar SQL examples and relevant documentation."
-            "3. Inspect schema by calling get_table_schemas."
-            "4. With all context, produce ONLY the final DuckDB SQL query."
-        )),
-            self.user_message(user_question)
-        ]
-        fs = self.get_few_shot_and_docs(user_question)
-        messages.append({"role": "assistant",
-                         "function_call": {"name": "get_few_shot_and_docs", "arguments": str({"question": user_question})}})
-        messages.append({"role": "tool", "name": "get_few_shot_and_docs", "tool_call_id": "fs1", "content": str(fs)})
-        # call get_table_schemas
-        sch = self.get_table_schemas()
-        messages.append({"role": "assistant", "function_call": {"name": "get_table_schemas", "arguments": str({})}})
-        messages.append({"role": "tool", "name": "get_table_schemas", "tool_call_id": "sch1", "content": str(sch)})
-        from openai import OpenAI
-        api_key = "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"
-        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1/")
-        tools = [
-            self.tool_definition(
-                tool_name="get_table_schemas",
-                tool_description="Return a list of tables available to query, each with its columns and data types and a 5 row sample of the data, it should be used when you are ready to build the SQL query and you need the information about the tables to query, dont use it unless the question is clear.",
-                properties={},
-                required=[]
-            ),
-            self.tool_definition(
-                tool_name="get_user_clarification",
-                tool_description="This tool is used to ask the user for further clarification, it should be used when the initial question is ambiguous, it has one parameter 'clarification_question' which you should provide to ask it to the user, example: user: 'what is the trs of today', clarification_question: 'can define what does the TRS stand for?'",
-                properties={
-                    "clarification_questions": {"type": "string", "description": "The questions to ask the user so he can provide more clarification"}
-                },
-                required=["clarification_questions"]
-            ),
-            self.tool_definition(
-                tool_name="get_few_shot_and_docs",
-                tool_description="Retrieve similar example SQL queries with their proper question and related documentation for the user's question from a RAG DB, it should be used when you need further context.",
-                properties={
-                    "question": {"type": "string", "description": "The user's original question"},
-                    "kwargs": {"type": "object",
-                               "description": "Optional parameters for similarity search and documentation retrieval"}
-                },
-                required=["question"]
-            )
+        if not self.is_sql_valid(extracted_sql):
+            return "your SQL is not valid"
 
-        ]
-        while True:
-            print("asking the model")
-            resp = client.chat.completions.create(
-                model="qwen-qwq-32b",
-                messages=messages,
-                tools=tools,
-            )
-            msg = resp.choices[0].message
-            print("msg returned: ")
-            pprint.pprint(msg)
-
-            # 2) If the model wants to call a tool…
-            if msg.tool_calls:
-                call = msg.tool_calls[0]
-                name = call.function.name
-                args = ast.literal_eval(call.function.arguments) or {}
-
-                print(f"model called {name} tool")
-                print(f"the args returned are: {args}")
-
-                # 3) Execute the matching Python function
-                if name == "get_table_schemas":
-                    tool_out = self.get_table_schemas()
-                elif name == "get_user_clarification":
-                    tool_out = self.get_user_clarification(args["clarification_questions"])
-                elif name == "get_few_shot_and_docs":
-                    tool_out = self.get_few_shot_and_docs(args["question"])
-                else:
-                    raise RuntimeError(f"Unknown tool: {name}")
-
-                print("got this as a result")
-                pprint.pprint(tool_out)
-                # 4) Append assistant's tool call and the tool result
-                messages.append(self.assistant_message(function_call={"name": name, "arguments": str(args)}))
-                messages.append(self.tool_message(name, call.id, str(tool_out)))
-
-                # 5) If it was a clarification call, immediately return that question
-                if name == "get_user_clarification":
-                    return str(tool_out["clarification"])
-
-                final_response = msg.content or ""
-                sql = self.extract_sql(final_response)
-                if not sql == "":
-                    try:
-                        return self.con.sql(query=sql).df()
-                    except Exception as e:
-                        print(f"the model encountred an error {e} and it will try to fix it")
-                        messages.append(self.user_message(f"i executed the sql query and got this error:```{e}```"))
-
-                continue
-
-
-            # ask again for valid SQL
-            messages.append(self.user_message("I didn’t detect a valid SQL query—please provide only the SQL statement ending with a semicolon."))
+        try:
+            result = self.con.sql(query=sql)
+            df = result.df()
+            return df
+        except Exception as e:
+            msg = f"got an exception while executing the sql: {e}"
+            print(msg)
+            return msg
 
     def generate_sql(self, question: str, allow_llm_to_see_data=False, **kwargs) -> str:
         """
@@ -213,6 +291,8 @@ class CopilotBase(ABC):
             initial_prompt = None
 
         dfs_uploaded = kwargs.pop('dfs', None)
+        user_id = kwargs.get("user_id", "no_user")
+        conversation_id = kwargs.get("conversation_id", "no id")
         question_sql_list = self.get_similar_question_sql(question, **kwargs)
         doc_list = self.get_related_documentation(question, **kwargs)
         ddl_list = self.get_related_ddl(question, **kwargs)
@@ -226,6 +306,8 @@ class CopilotBase(ABC):
             **kwargs,
         )
         self.log(title="SQL Prompt", message=prompt)
+        for message in prompt:
+            self.insert_message_db(conversation_id, user_id, role=message["role"], content=message["content"])
         llm_response = self.submit_prompt(prompt, **kwargs)
         self.log(title="LLM Response", message=llm_response)
 
@@ -650,7 +732,7 @@ class CopilotBase(ABC):
         pass
 
     @abstractmethod
-    def assistant_message(self, message: str, function_call: dict) -> any:
+    def assistant_message(self, message: str, tool_call: dict) -> any:
         pass
 
     @abstractmethod
@@ -658,7 +740,11 @@ class CopilotBase(ABC):
         pass
 
     @abstractmethod
-    def use_agentic_mode(self, user_question):
+    def tool_call(self, call_id, call_type, function_name, function_args):
+        pass
+
+    @abstractmethod
+    def use_agentic_mode(self, user_question: str, user_id: str, conversation_id: str = None):
         pass
 
     def str_to_approx_token_count(self, string: str) -> int:

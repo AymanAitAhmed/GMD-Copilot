@@ -15,6 +15,7 @@ import re
 import pandas as pd
 import duckdb
 import flask
+from flask_cors import CORS
 import requests
 from flasgger import Swagger
 from flask import Flask, Response, jsonify, request, send_from_directory, session, make_response, flash
@@ -92,7 +93,8 @@ class MemoryCache(Cache):
 
     def get_all(self, field_list) -> list:
         return [
-            {"id": id, **{field: self.get(id=id, field=field) for field in field_list}}
+            {"id": id, "name": "this is a mock title", "created_at": time.time(),
+             **{field: self.get(id=id, field=field) for field in field_list}}
             for id in self.cache
         ]
 
@@ -176,6 +178,15 @@ class FlaskAPI:
         """
 
         self.flask_app = Flask(__name__)
+        CORS(
+            self.flask_app,
+            supports_credentials=True,
+            resources={
+                r"/api/*": {
+                    "origins": "http://localhost:3001"
+                }
+            }
+        )
 
         self.swagger = Swagger(
             self.flask_app, template={"info": {"title": "Copilot API"}}
@@ -278,7 +289,7 @@ class FlaskAPI:
                     training_data["question"].str.len() < self.max_generated_question_length]
                 questions = (
                     filtered_training_data[filtered_training_data["question"].notnull()]
-                    .sample(5)["question"]
+                    .sample(3)["question"]
                     .tolist()
                 )
 
@@ -313,8 +324,14 @@ class FlaskAPI:
             def allowed_file(filename):
                 return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-            results = []
+            session_id = request.cookies.get('session_id', 'unknown')
+            if not session_id or session_id == 'unknown':  # Ensure session_id is valid
+                return jsonify({"type": "error", "error": "Invalid session."})
 
+            if not self.copilot.con:
+                return jsonify({"type": "error", "error": "Database connection not available."})
+
+            results = []
             for key in file_keys:
                 file = request.files.get(key)
                 if not file or file.filename == '':
@@ -325,13 +342,40 @@ class FlaskAPI:
                                     "error": f"File '{file.filename}': only files with extensions {ALLOWED_EXTENSIONS} are allowed"})
 
                 # Build a secure filename using the session_id cookie
-                session_id = request.cookies.get('session_id', 'unknown')
                 filename = secure_filename("file_" + session_id + "_" + file.filename)
-                file_path = os.path.join(tmp_file_dir, filename)  # Ensure tmp_file_dir is defined elsewhere
+                file_path = os.path.join(tmp_file_dir, filename)
 
                 try:
                     file.save(file_path)
-                    results.append(f"File '{filename}' uploaded successfully")
+                    results.append(f"File '{file.filename}' uploaded successfully")
+                    # --adding the file to duckdb--
+                    df = None
+                    if file.filename.lower().endswith('.csv'):
+                        df = pd.read_csv(file.stream)
+                    else:
+                        excel_file = pd.ExcelFile(file.stream)
+                        if excel_file.sheet_names:
+                            sheet_name = excel_file.sheet_names[0]
+                            df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                        else:
+                            results.append(f"File '{file.filename}': No sheets found in Excel file.")
+                            continue
+
+                    if df is not None and not df.empty:
+
+                        current_session_tables = self.copilot.con.sql(
+                            f"SELECT table_name FROM information_schema.tables WHERE table_schema = 'temp'").fetchall()
+                        table_index = len(current_session_tables)
+                        unique_table_name = f"table_{table_index}"
+
+                        self.copilot.con.sql(
+                            f"""CREATE OR REPLACE TEMP TABLE "{unique_table_name}" AS SELECT * FROM df;""")
+                        results.append(
+                            f"File '{file.filename}' loaded as temporary table '{unique_table_name}'.")
+
+                    else:
+                        results.append(f"File '{file.filename}' was empty or could not be read into a DataFrame.")
+
                 except Exception as e:
                     results.append(f"Error saving file '{filename}': {str(e)}")
 
@@ -468,26 +512,26 @@ class FlaskAPI:
             """
 
             question = flask.request.args.get("question")
+            user_id = flask.request.cookies.get("session_id")
 
             if question is None or question == "":
                 return jsonify({"type": "error", "error": "No question provided"})
 
-
-
             dfs = get_uploaded_spreadsheets()
 
-            id = self.cache.generate_id(question=question)
+            conversation_id = self.cache.generate_id(question=question)
 
-            sql = copilot.generate_sql(question=question, allow_llm_to_see_data=self.allow_llm_to_see_data, dfs=dfs)
+            sql = copilot.generate_sql(question=question, allow_llm_to_see_data=self.allow_llm_to_see_data, dfs=dfs,
+                                       user_id=user_id, conversation_id=conversation_id)
 
-            self.cache.set(id=id, field="question", value=question)
-            self.cache.set(id=id, field="sql", value=sql)
+            self.cache.set(id=conversation_id, field="question", value=question)
+            self.cache.set(id=conversation_id, field="sql", value=sql)
 
             if copilot.is_sql_valid(sql=sql):
                 return jsonify(
                     {
                         "type": "sql",
-                        "id": id,
+                        "id": conversation_id,
                         "text": sql,
                     }
                 )
@@ -495,7 +539,7 @@ class FlaskAPI:
                 return jsonify(
                     {
                         "type": "text",
-                        "id": id,
+                        "id": conversation_id,
                         "text": sql,
                     }
                 )
@@ -649,16 +693,17 @@ class FlaskAPI:
             attempt = 0
             last_error = None
 
-            if not copilot.run_sql_is_set:
+            if not self.copilot.run_sql_is_set:
                 return jsonify({
                     "type": "error",
                     "error": "Please connect to a database using copilot.connect_to_... in order to run SQL queries."
                 })
 
-            dfs = get_uploaded_spreadsheets()
-            if len(dfs) >= 1:
-                for i, df in enumerate(dfs):
-                    self.copilot.con.sql(f"""CREATE OR REPLACE TEMP TABLE table{i} AS SELECT * FROM df;""")
+            # uncomment if the uploading logic dont work
+            # dfs = get_uploaded_spreadsheets()
+            # if len(dfs) >= 1:
+            #     for i, df in enumerate(dfs):
+            #         self.copilot.con.sql(f"""CREATE OR REPLACE TEMP TABLE table{i} AS SELECT * FROM df;""")
 
             while attempt < self.max_attempts:
                 try:
@@ -687,7 +732,8 @@ class FlaskAPI:
                         self.cache.set(id=id, field="sql", value=sql)
                     else:
                         print(traceback.format_exc())
-                        return jsonify({"type": "sql_error", "error": f"The Copilot tried fixing the error for {max_attempts} times but didn't succeed."})
+                        return jsonify({"type": "sql_error",
+                                        "error": f"The Copilot tried fixing the error for {max_attempts} times but didn't succeed."})
 
         @self.flask_app.route("/api/v0/fix_sql", methods=["POST"])
         @self.requires_auth
@@ -958,17 +1004,102 @@ class FlaskAPI:
                     {"type": "error", "error": "Couldn't remove training data"}
                 )
 
-
-        @self.flask_app.route("/run_agent", methods= ["POST"])
-        def run_agent_endpoint()-> any:
+        @self.flask_app.route("/api/v0/run_agent", methods=["POST"])
+        def run_agent_endpoint() -> any:
             data = request.get_json()
             question = data.get("question")
             if not question:
                 return jsonify({"error": "Missing 'question' in request body."}), 400
 
-            sql_or_clarification = copilot.use_agentic_mode(question)
-            return jsonify({"success": sql_or_clarification})
-
+            user_id = flask.request.cookies.get("session_id")
+            thread_id = data.get("thread_id") or None  # Ensure it's None if empty
+            print("cookies: ",flask.request.cookies.to_dict())
+            print("thread_id from request: ", thread_id)
+            print("user_id: ", user_id)
+            
+            # Use the new method to get or create a conversation ID
+            # This preserves None values which trigger _build_initial_messages later
+            conversation_id = self.copilot.get_or_create_conversation_id(thread_id, user_id, question)
+            
+            # Store task info in cache for status endpoint and streaming
+            self.cache.set(conversation_id, "status", "UNDERSTANDING")
+            self.cache.set(conversation_id, "type", "TEXT_TO_SQL")
+            self.cache.set(conversation_id, "question", question)
+            self.cache.set(conversation_id, "user_id", user_id)
+            self.cache.set(conversation_id, "thread_id", thread_id)  # Store original thread_id if any
+            
+            # Return initial response with queryId to start the process
+            return jsonify({
+                "askingTask": {
+                    "queryId": conversation_id,
+                    "status": "UNDERSTANDING",
+                    "type": "TEXT_TO_SQL",
+                    "question": question,
+                    "retrievedTables": [],
+                    "sqlGenerationReasoning": ""
+                }
+            })
+            
+        @self.flask_app.route("/api/v0/api/ask_task/streaming", methods=["GET"])
+        def streaming_endpoint():
+            query_id = request.args.get('queryId')
+            if not query_id:
+                return jsonify({"error": "Missing queryId parameter"}), 400
+                
+            # Get stored info from cache
+            question = self.cache.get(query_id, "question")
+            user_id = self.cache.get(query_id, "user_id")
+            thread_id = self.cache.get(query_id, "thread_id")  # Get original thread_id if any
+            
+            if not question or not user_id:
+                return jsonify({"error": "Invalid queryId or missing data"}), 404
+                
+            # Update status to SEARCHING
+            self.cache.set(query_id, "status", "SEARCHING")
+            
+            # Use the streaming method from LLM integration
+            # Important: We pass thread_id here, which might be None
+            # This preserves the correct conversation creation logic
+            def generate():
+                # Pass iterator results from stream_response to the client
+                for response in self.copilot.stream_response(question, user_id, thread_id):
+                    yield f"data: {response}\n\n"
+                    
+                    # Parse response to extract message and done status
+                    try:
+                        response_data = json.loads(response)
+                        if response_data.get('done', False):
+                            # Update status to FINISHED when done
+                            self.cache.set(query_id, "status", "FINISHED")
+                    except json.JSONDecodeError:
+                        pass
+                    
+            return Response(generate(), mimetype='text/event-stream')
+            
+        @self.flask_app.route("/api/v0/api/ask_task/status", methods=["GET"])
+        def task_status_endpoint():
+            query_id = request.args.get('queryId')
+            if not query_id:
+                return jsonify({"error": "Missing queryId parameter"}), 400
+                
+            # Retrieve task info from cache
+            status = self.cache.get(query_id, "status") or "UNDERSTANDING"
+            task_type = self.cache.get(query_id, "type") or "TEXT_TO_SQL"
+            question = self.cache.get(query_id, "question") or ""
+            
+            # Build response with available data
+            response = {
+                "askingTask": {
+                    "queryId": query_id,
+                    "status": status,
+                    "type": task_type,
+                    "question": question,
+                    "retrievedTables": [],
+                    "sqlGenerationReasoning": ""
+                }
+            }
+            
+            return jsonify(response)
 
         @self.flask_app.route("/api/v0/train", methods=["POST"])
         @self.requires_auth
@@ -1211,11 +1342,7 @@ class FlaskAPI:
 
         @self.flask_app.route("/api/v0/load_question", methods=["GET"])
         @self.requires_auth
-        @self.requires_cache(
-            ["question", "sql", "df"],
-            optional_fields=["summary", "fig_json"]
-        )
-        def load_question(user: any, id: str, question, sql, df, fig_json, summary):
+        def load_question(user: any):
             """
             Load question
             ---
@@ -1247,20 +1374,28 @@ class FlaskAPI:
                     summary:
                       type: string
             """
+            user_id = flask.request.cookies.get("session_id")
+            conv_id = flask.request.args.get("id", None)
+            if not conv_id:
+                return jsonify({"type": "error", "error": "`id` query-parameter is required"}), 400
+
+            print("got this id:", conv_id)
             try:
-                return jsonify(
-                    {
-                        "type": "question_cache",
-                        "id": id,
-                        "question": question,
-                        "sql": sql,
-                        "df": df.head(10).to_json(orient="records", date_format="iso"),
-                        "fig": fig_json,
-                        "summary": summary,
-                    }
-                )
+                # return jsonify(
+                #     {
+                #         "type": "question_cache",
+                #         "id": id,
+                #         "question": question,
+                #         "sql": sql,
+                #         "df": df.head(10).to_json(orient="records", date_format="iso"),
+                #         "fig": fig_json,
+                #         "summary": summary,
+                #     }
+                # )
+                return copilot.get_conversation_by_id(user_id=user_id, conversation_id=conv_id)
 
             except Exception as e:
+                traceback.print_exc()
                 return jsonify({"type": "error", "error": str(e)})
 
         @self.flask_app.route("/api/v0/get_question_history", methods=["GET"])
@@ -1286,12 +1421,13 @@ class FlaskAPI:
                         type: string
             """
 
+            user_id = flask.request.cookies.get("session_id")
             all_questions = cache.get_all(field_list=["question"])
 
             return jsonify(
                 {
                     "type": "question_history",
-                    "questions": all_questions,
+                    "questions": copilot.get_conversation_history(user_id),
                 }
             )
 

@@ -27,7 +27,7 @@ base_app = BaseApp(config={
     'model': 'microsoft/mai-ds-r1:free',
     "path": chromadb_path,
     "client": "persistent",
-    "temperature": 0.3,
+    "temperature": 0,
     "language": "French",
     "n_results_sql": 6
 })

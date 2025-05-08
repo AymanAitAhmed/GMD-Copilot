@@ -7,8 +7,9 @@ def call_run_agent(server_url: str, question: str):
     """
     url = f"{server_url.rstrip('/')}/run_agent"
     payload = {"question": question}
+    cookies = {"session_id": "user_id1012"}
     try:
-        r = requests.post(url, json=payload, timeout=60)
+        r = requests.post(url, json=payload, cookies=cookies,timeout=60)
         r.raise_for_status()
     except requests.RequestException as e:
         print("Request failed:", e)
