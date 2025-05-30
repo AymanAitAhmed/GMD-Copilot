@@ -1,5 +1,6 @@
 import json
 from typing import List
+import traceback
 
 import chromadb
 import pandas as pd
@@ -25,6 +26,7 @@ class ChromaDB_VectorStore(CopilotBase):
         self.n_results_sql = config.get("n_results_sql", config.get("n_results", 10))
         self.n_results_documentation = config.get("n_results_documentation", config.get("n_results", 10))
         self.n_results_ddl = config.get("n_results_ddl", config.get("n_results", 10))
+        self.similarity_threshold = 1.90
 
         if curr_client == "persistent":
             self.chroma_client = chromadb.PersistentClient(
@@ -228,7 +230,7 @@ class ChromaDB_VectorStore(CopilotBase):
         return False
 
     @staticmethod
-    def _extract_documents(query_results) -> list:
+    def _extract_documents(query_results, similarity_threshold=None) -> list:
         """
         Static method to extract the documents from the results of a query.
 
@@ -244,12 +246,28 @@ class ChromaDB_VectorStore(CopilotBase):
 
         if "documents" in query_results:
             documents = query_results["documents"]
+            distances = query_results["distances"]
 
             if len(documents) == 1 and isinstance(documents[0], list):
+
                 try:
-                    documents = [json.loads(doc) for doc in documents[0]]
+                    filtered_documents = []
+                    for i in range(len(documents[0])):
+
+                        doc = documents[0][i]
+                        dist = distances[0][i]
+                        if similarity_threshold is None or dist <= similarity_threshold:
+
+                            if "question" in doc and 'sql' in doc:
+                                filtered_documents.append(json.loads(doc))
+                                continue
+                            filtered_documents.append(doc)
+
+                    return filtered_documents
                 except Exception as e:
-                    return documents[0]
+                    traceback.print_stack()
+                    print("exception in _extract_documents:", e)
+                    return [json.loads(doc) for doc in documents[0]]
 
             return documents
 
@@ -266,13 +284,13 @@ class ChromaDB_VectorStore(CopilotBase):
             self.ddl_collection.query(
                 query_texts=[question],
                 n_results=self.n_results_ddl,
-            )
+            ),
+            similarity_threshold=self.similarity_threshold
         )
 
     def get_related_documentation(self, question: str, **kwargs) -> list:
-        return ChromaDB_VectorStore._extract_documents(
-            self.documentation_collection.query(
-                query_texts=[question],
+        query = self.documentation_collection.query(
+                query_texts=question,
                 n_results=self.n_results_documentation,
             )
-        )
+        return ChromaDB_VectorStore._extract_documents(query,self.similarity_threshold)

@@ -24,12 +24,12 @@ class BaseApp(ChromaDB_VectorStore, OpenAI_Chat):
 
 
 base_app = BaseApp(config={
-    'model': 'microsoft/mai-ds-r1:free',
+    'model': 'deepseek/deepseek-r1-0528:free',
     "path": chromadb_path,
     "client": "persistent",
     "temperature": 0,
     "language": "French",
-    "n_results_sql": 6
+    "n_results_sql": 3
 })
 
 try:
@@ -38,7 +38,7 @@ try:
 except:
     db_host = '127.0.0.1'
     db_port = 5432
-    db_user = 'gmd'
+    db_user = 'postgres'
     db_password = '1234'
     db_name = 'gmd_iot'
     base_app.connect_to_database(host=db_host, dbname=db_name, user=db_user, password=db_password,

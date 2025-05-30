@@ -11,6 +11,7 @@ import pprint
 import sqlite3
 import datetime
 import threading
+import uuid  # Added for generating conversation IDs
 
 import pandas as pd
 import duckdb
@@ -20,12 +21,41 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import sqlparse
+from flask import g, has_app_context
 
 from .exceptions import ImproperlyConfigured, ValidationError
 from .training_plan import TrainingPlan, TrainingPlanItem
 
 CONVERSATION_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\conversations.db"
 thread_local = threading.local()
+
+
+def get_connection():
+    """
+    If we are in a Flask request context, reuse g.db_conn (or open it).
+    Otherwise fall back to a thread‑local connection.
+    """
+    if has_app_context():
+        # Flask request → store in g
+        if not hasattr(g, 'db_conn'):
+            conn = sqlite3.connect(CONVERSATION_DB_PATH,
+                                   timeout=30.0,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            g.db_conn = conn
+        return g.db_conn
+    else:
+        # outside Flask → thread‑local
+        conn = getattr(thread_local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(CONVERSATION_DB_PATH,
+                                   timeout=30.0,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.commit()
+            thread_local.conn = conn
+        return conn
 
 
 class CopilotBase(ABC):
@@ -49,173 +79,218 @@ class CopilotBase(ABC):
 
         return f"You must Respond {self.language} language."
 
+    def create_new_conversation(self, user_question: str, user_id: str, **kwargs) -> str:
+        """
+        Creates a new conversation, stores the initial system prompt, user question,
+        and simulated tool interaction as context, and returns the conversation ID.
+        Tool calls are represented as normal assistant/user messages.
+
+        Args:
+            user_question (str): The initial question from the user.
+            user_id (str): The ID of the user initiating the conversation.
+
+        Returns:
+            str: The newly generated conversation ID.
+        """
+        self.log(f"Creating new conversation (contextual tools) for user_id: {user_id} with question: {user_question}")
+        conversation_id = str(uuid.uuid4())
+
+        if self.config is not None:
+            initial_prompt = self.config.get("initial_prompt", None)
+        else:
+            initial_prompt = None
+
+        dfs_uploaded = kwargs.pop('dfs', None)
+        question_sql_list = self.get_similar_question_sql(user_question, **kwargs)
+        doc_list = self.get_related_documentation(user_question, **kwargs)
+        messages = self.get_sql_prompt(
+            initial_prompt=initial_prompt,
+            question=user_question,
+            question_sql_list=question_sql_list,
+            doc_list=doc_list,
+            dfs=dfs_uploaded,
+            **kwargs,
+        )
+
+        for msg in messages:
+            self.insert_message_db(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                role=msg['role'],
+                content=msg['content']
+            )
+        return conversation_id
+
     # ----database related----
 
-    # def _initialize_database(self):
-    #     """Initializes the SQLite database connection and creates the table if needed."""
-    #     try:
-    #         self.conn = sqlite3.connect(self.db_path)
-    #         self.cursor = self.conn.cursor()
-    #         self.cursor.execute("""
-    #              CREATE TABLE IF NOT EXISTS message_history (
-    #                  timestamp DATETIME NOT NULL,
-    #                  conversation_id TEXT PRIMARY KEY NOT NULL,
-    #                  user_id TEXT NOT NULL,
-    #                  role TEXT NOT NULL,
-    #                  content TEXT NOT NULL,
-    #                  tool_call_id TEXT, -- Optional: For linking tool requests and responses
-    #                  tool_name TEXT     -- Optional: Name of the tool called/responded
-    #              )
-    #          """)
-    #         self.conn.commit()
-    #         print(f"Database initialized successfully at {self.db_path}")
-    #     except sqlite3.Error as e:
-    #         print(f"Database error during initialization: {e}")
-    #         # Potentially raise the error or handle it more gracefully
-    #         if self.conn:
-    #             self.conn.close()
-    #
-    # def close_db(self):
-    #     """Closes the database connection."""
-    #     if self.conn:
-    #         self.conn.close()
-    #         print("Database connection closed.")
-
-    def get_connection(self, db_path=CONVERSATION_DB_PATH):
-        conn = getattr(thread_local, 'conn', None)
-        if conn is None:
-            conn = sqlite3.connect(db_path, check_same_thread=False)
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS message_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME NOT NULL,
-                    conversation_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT,
-                    tool_call_id TEXT,
-                    tool_name TEXT,
-                    extracted_sql TEXT,
-                    reasoning TEXT
-                );
-            ''')
-            conn.commit()
-            thread_local.conn = conn
-        return conn
-
-    def insert_message_db(self, conversation_id, user_id, role, content=None, tool_call_id=None, tool_name=None,
+    def insert_message_db(self, conversation_id, user_id, role=None, tool_call_id=None, content=None, tool_calls=None,
                           extracted_sql=None, reasoning=None):
-        conn = self.get_connection()
+        conn = get_connection()
         cursor = conn.cursor()
         timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
-        cursor.execute(
-            """INSERT INTO message_history (timestamp,conversation_id,user_id,role,content,tool_call_id,tool_name,extracted_sql,reasoning)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (timestamp, conversation_id, user_id, role, content, tool_call_id, tool_name, extracted_sql, reasoning)
-        )
-        conn.commit()
-        cursor.close()
+        try:
+            cursor.execute(
+                """INSERT INTO message_history (timestamp,conversation_id,user_id,role,tool_call_id,content,tool_calls,extracted_sql,reasoning)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (timestamp, conversation_id, user_id, role, tool_call_id, content, str(tool_calls), extracted_sql,
+                 reasoning)
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            # We don't close the connection here as it's managed by Flask's app context
 
     def get_conversation_history(self, user_id):
-        conn = self.get_connection()
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT conversation_id, timestamp, role, content, tool_call_id, tool_name, extracted_sql, reasoning"
-            " FROM message_history ORDER BY timestamp"
-        )
-        rows = cursor.fetchall()
+        all_conversations_data = []
 
-        convos = {}
-        for conv_id, ts, role, content, tool_call_id, tool_name, extracted_sql, reasoning in rows:
-            if conv_id not in convos:
-                convos[conv_id] = {
+        try:
+            # Step 1: Get all distinct conversation IDs
+            cursor.execute("SELECT DISTINCT conversation_id FROM message_history ORDER BY timestamp DESC")
+            distinct_conv_ids_rows = cursor.fetchall()
+            distinct_conv_ids = [row[0] for row in distinct_conv_ids_rows]
+
+            if not distinct_conv_ids:
+                return []  # No conversations found
+
+            # Step 2: For each conversation_id, get its messages
+            for conv_id in distinct_conv_ids:
+                cursor.execute(
+                    "SELECT timestamp, role, content, tool_calls, extracted_sql, reasoning "
+                    "FROM message_history "
+                    "WHERE conversation_id = ? "
+                    "ORDER BY timestamp ASC",  # Order messages by timestamp to easily find first and last
+                    (conv_id,)
+                )
+                messages_rows = cursor.fetchall()
+
+                if not messages_rows:
+                    # This case should ideally not happen if conv_id comes from the table itself,
+                    # but as a safeguard:
+                    print(f"Warning: No messages found for conversation_id {conv_id}, skipping.")
+                    continue
+
+                conversation_messages = []
+                # The first message's timestamp is the conversation's creation time
+                conversation_created_at = messages_rows[0][0]  # timestamp is the first column (index 0)
+
+                # Default name is the conversation ID
+                conversation_name = str(conv_id)
+
+                for ts, role, content, tool_calls, extracted_sql, reasoning in messages_rows:
+                    # Update conversation name if the message is from a user and has content
+                    # Since messages are ordered by timestamp ASC, the last user message encountered
+                    # will set the final name.
+                    if role == 'user' and content:
+                        conversation_name = content
+
+                    msg = {'role': role, 'text': content, 'timestamp': ts}
+
+                    # Attach SQL and reasoning if present for assistant messages
+                    if role == 'assistant':
+                        if extracted_sql:
+                            msg['sql'] = extracted_sql
+                        if reasoning:
+                            msg['reasoning'] = reasoning
+
+                    conversation_messages.append(msg)
+
+                # Construct the conversation object
+                convo_obj = {
                     'id': conv_id,
-                    'createdAt': ts,
-                    'name': f"conversation {conv_id}",
-                    'messages': []
+                    'createdAt': conversation_created_at,
+                    'name': conversation_name,
+                    'messages': conversation_messages
                 }
-            msg = {'role': role, 'text': content, 'timestamp': ts}
-            # Attach SQL and reasoning if present
-            if role == 'assistant':
-                if extracted_sql:
-                    msg['sql'] = extracted_sql
-                if reasoning:
-                    msg['reasoning'] = reasoning
-            convos[conv_id]['messages'].append(msg)
+                all_conversations_data.append(convo_obj)
 
-        cursor.close()
-        return list(convos.values())
+            # all_conversations_data.sort(key=lambda c: c['createdAt'], reverse=True)
+
+            return all_conversations_data
+
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            # Depending on error handling strategy, you might want to raise the exception,
+            # return None, or return an empty list.
+            return []  # Or raise e
+        finally:
+            if cursor:
+                cursor.close()
 
     def get_conversation_by_id(self, user_id, conversation_id):
-        conn = self.get_connection()
+        conn = get_connection()
         cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT DISTINCT user_id FROM message_history WHERE conversation_id = ?",
+                (str(conversation_id),)
+            )
+            row = cursor.fetchone()
 
-        cursor.execute(
-            "SELECT DISTINCT user_id FROM message_history WHERE conversation_id = ?",
-            (str(conversation_id),)
-        )
-        row = cursor.fetchone()
-        if not row or row[0] is None:
-            raise ValueError(f"Conversation '{conversation_id}' not found.")
+            # Check if conversation exists and user has access
+            if not row or (row[0] is None):
+                raise ValueError(f"Conversation '{conversation_id}' not found.")
 
-        cursor.execute(
-            "SELECT timestamp, role, content, tool_call_id, tool_name, extracted_sql, reasoning"
-            " FROM message_history WHERE conversation_id = ? ORDER BY timestamp",
-            (conversation_id,)
-        )
-        rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT timestamp, role, content, tool_calls, extracted_sql, reasoning"
+                " FROM message_history WHERE conversation_id = ? ORDER BY timestamp",
+                (conversation_id,)
+            )
+            rows = cursor.fetchall()
 
-        user_question = None
-        assistant_sql = None
-        assistant_reasoning = None
-        assistant_content = None
-        query_id = None
-        print(rows[-1])
-        for ts, role, content, tool_call_id, tool_name, extracted_sql, reasoning in rows:
-            print(f"////////////////{role}\n", content)
-            if role == 'user' and user_question is None:
-                user_question = content
-            elif role == 'assistant':
-                # Prefer stored extracted_sql
-                assistant_content = content
-                if extracted_sql:
-                    assistant_sql = extracted_sql
-                    assistant_reasoning = reasoning
-                    query_id = tool_call_id
-                # Fallback: detect SQL in content by simple pattern
-                if assistant_sql is None and content and content.strip().endswith(';'):
-                    assistant_sql = content.strip()
+            user_question = None
+            assistant_sql = None
+            assistant_reasoning = None
+            assistant_content = None
+            query_id = None
+            for ts, role, content, tool_calls, extracted_sql, reasoning in rows:
+                if role == 'user' :
+                    user_question = content
+                    assistant_content = None
+                    assistant_sql = None
+                    assistant_reasoning = None
+                elif role == 'assistant':
+                    # Prefer stored extracted_sql
+                    assistant_content = content
+                    if extracted_sql:
+                        assistant_sql = extracted_sql
+                        assistant_reasoning = reasoning
+                    # Fallback: detect SQL in content by simple pattern
+                    if assistant_sql is None and content and content.strip().endswith(';'):
+                        assistant_sql = content.strip()
+            status = "FINISHED" if assistant_sql and assistant_sql != "" and assistant_content and assistant_content != '' else "STREAMING"
+            response_item = {
+                "id": conversation_id,
+                "threadId": conversation_id,
+                "question": user_question,
+                "sql": assistant_sql,
+                "view": None,
+                "breakdownDetail": None,
+                "answerDetail": {
+                    "queryId": query_id,
+                    "status": status,
+                    "content": assistant_content,
+                    "reasoning": assistant_reasoning,
+                    "numRowsUsedInLLM": 1,
+                    "error": None,
+                    "__typename": "ThreadResponseAnswerDetail"
+                },
+                "chartDetail": None,
+                "askingTask": None,
+                "adjustment": None,
+                "adjustmentTask": None,
+                "__typename": "ThreadResponse"
+            }
 
-        response_item = {
-            "id": conversation_id,
-            "threadId": conversation_id,
-            "question": user_question,
-            "sql": assistant_sql,
-            "view": None,
-            "breakdownDetail": None,
-            "answerDetail": {
-                "queryId": query_id,
-                "status": "FINISHED",
-                "content": assistant_content,
-                "reasoning": assistant_reasoning,
-                "numRowsUsedInLLM": 1,
-                "error": None,
-                "__typename": "ThreadResponseAnswerDetail"
-            },
-            "chartDetail": None,
-            "askingTask": None,
-            "adjustment": None,
-            "adjustmentTask": None,
-            "__typename": "ThreadResponse"
-        }
-
-        thread_data = {
-            "id": conversation_id,
-            "responses": [response_item] if user_question else [],
-            "__typename": "DetailedThread"
-        }
-        cursor.close()
-        return {"data": {"thread": thread_data}}
+            thread_data = {
+                "id": conversation_id,
+                "responses": [response_item] if user_question else [],
+                "__typename": "DetailedThread"
+            }
+            return {"data": {"thread": thread_data}}
+        finally:
+            cursor.close()
 
     def get_table_schemas(self, ):
         """
@@ -228,21 +303,56 @@ class CopilotBase(ABC):
          ]}
          """
         # fetch schema info
-        ddl = self.con.sql(
-            "SELECT table_name, column_name, data_type"
-            " FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'"
-        ).df()
+        cursor = self.con.cursor()
+        try:
+            ddl = cursor.sql(
+                "SELECT table_name, column_name, data_type "
+                "FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'"
+            ).df()
 
-        tables = []
-        for table, group in ddl.groupby("table_name"):
-            # columns
-            cols = [{"name": row["column_name"], "type": row["data_type"]} for _, row in group.iterrows()]
-            # sample rows
-            sample_df = self.con.sql(f"SELECT * FROM {table} LIMIT 5").df()
-            sample = sample_df.to_dict(orient="records")
-            tables.append({"table": table, "columns": cols, "sample_rows": sample})
+            tables = []
+            for table, group in ddl.groupby("table_name"):
+                cols = [{"name": r["column_name"], "type": r["data_type"]}
+                        for _, r in group.iterrows()]
+                sample_df = cursor.sql(f"SELECT * FROM {table} LIMIT 1").df()
+                sample = sample_df.to_dict(orient="records")
+                tables.append({"table": table, "columns": cols, "sample_rows": sample})
+            return {"tables": tables}
+        finally:
+            cursor.close()
 
-        return {"tables": tables}
+    def create_or_load_conversation(self, conversation_id: str, user_id: str) -> list:
+        """
+        Load prior messages from DB and convert to LLM format.
+        """
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role,tool_call_id, content, tool_calls, extracted_sql, reasoning"
+            " FROM message_history WHERE conversation_id = ? ORDER BY timestamp",
+            (conversation_id,)
+        )
+        msgs = []
+        rows = cursor.fetchall()
+        tool_name = ""
+        for role, tool_call_id, content, tool_calls, extracted_sql, reasoning in rows:
+            if role == 'assistant' and tool_calls and tool_calls != "None":
+                # reconstruct function call messages if any
+                args = ast.literal_eval(tool_calls)[0]
+                tool_name = args['function']['name']
+                msg = self.assistant_message("", args)
+                msgs.append(msg)
+            elif role == 'tool':
+                msg = self.tool_message(name=tool_name, call_id=tool_call_id, tool_out=content)
+                msgs.append(msg)
+                tool_name = ""
+            else:
+                # system/user/assistant normal
+                msg = {'role': role, 'content': content}
+                msgs.append(msg)
+                tool_name = ""
+
+        return msgs
 
     def get_user_clarification(self, clarification_questions: str) -> dict:
         """
@@ -259,22 +369,7 @@ class CopilotBase(ABC):
         doc_list = self.get_related_documentation(question, **(kwargs or {}))
         return {"examples": question_sql_list, "docs": doc_list}
 
-    def execute_sql(self, sql):
-        extracted_sql = self.extract_sql(sql)
-
-        if not self.is_sql_valid(extracted_sql):
-            return "your SQL is not valid"
-
-        try:
-            result = self.con.sql(query=sql)
-            df = result.df()
-            return df
-        except Exception as e:
-            msg = f"got an exception while executing the sql: {e}"
-            print(msg)
-            return msg
-
-    def generate_sql(self, question: str, allow_llm_to_see_data=False, **kwargs) -> str:
+    def generate_sql(self, user_id, conversation_id, **kwargs) -> str:
         """
         Uses the LLM to generate a SQL query that answers a question. It runs the following methods:
 
@@ -285,61 +380,33 @@ class CopilotBase(ABC):
         Returns:
             str: The SQL query that answers the question.
         """
-        if self.config is not None:
-            initial_prompt = self.config.get("initial_prompt", None)
-        else:
-            initial_prompt = None
-
-        dfs_uploaded = kwargs.pop('dfs', None)
-        user_id = kwargs.get("user_id", "no_user")
-        conversation_id = kwargs.get("conversation_id", "no id")
-        question_sql_list = self.get_similar_question_sql(question, **kwargs)
-        doc_list = self.get_related_documentation(question, **kwargs)
-        ddl_list = self.get_related_ddl(question, **kwargs)
-        prompt = self.get_sql_prompt(
-            initial_prompt=initial_prompt,
-            question=question,
-            question_sql_list=question_sql_list,
-            ddl_list=ddl_list,
-            doc_list=doc_list,
-            dfs=dfs_uploaded,
-            **kwargs,
-        )
-        self.log(title="SQL Prompt", message=prompt)
-        for message in prompt:
-            self.insert_message_db(conversation_id, user_id, role=message["role"], content=message["content"])
-        llm_response = self.submit_prompt(prompt, **kwargs)
+        messages = self.create_or_load_conversation(conversation_id=conversation_id, user_id=user_id)
+        llm_response = self.submit_prompt(messages, **kwargs)
         self.log(title="LLM Response", message=llm_response)
-
-        if 'intermediate_sql' in llm_response:
-            if not allow_llm_to_see_data:
-                return "The LLM is not allowed to see the data in your database. Your question requires database introspection to generate the necessary SQL. Please set allow_llm_to_see_data=True to enable this."
-
-            if allow_llm_to_see_data:
-                intermediate_sql = self.extract_sql(llm_response)
-
-                try:
-                    self.log(title="Running Intermediate SQL", message=intermediate_sql)
-                    df = self.run_sql(intermediate_sql)
-                    # TODO: add logic to handle uploaded spreadsheet
-                    prompt = self.get_sql_prompt(
-                        initial_prompt=initial_prompt,
-                        question=question,
-                        question_sql_list=question_sql_list,
-                        ddl_list=ddl_list,
-                        doc_list=doc_list + [
-                            f"The following is a pandas DataFrame with the results of the intermediate SQL query {intermediate_sql}: \n" + df.to_markdown()],
-                        **kwargs,
-                    )
-                    self.log(title="Final SQL Prompt", message=prompt)
-                    llm_response = self.submit_prompt(prompt, **kwargs)
-                    self.log(title="LLM Response", message=llm_response)
-                except Exception as e:
-                    return f"Error running intermediate SQL: {e}"
 
         extracted_sql = self.extract_sql(llm_response)
 
         return self.fix_sql_case(extracted_sql)
+
+    def execute_sql(self, sql):
+        extracted_sql = self.extract_sql(sql)
+
+        if not self.is_sql_valid(extracted_sql):
+            return "your SQL is not valid"
+
+        cursor = self.con.cursor()
+        try:
+            result = cursor.sql(query=sql)
+            df = result.df()
+            return df
+        except Exception as e:
+            msg = (f"got an exception while executing the sql: ```{e}```.",
+                   "please fix the error and re-generate a new SQL query and try executing again using 'exectue_sql tool.'"
+                   )
+            print(msg)
+            return msg
+        finally:
+            cursor.close()
 
     def extract_sql(self, llm_response: str) -> str:
         """
@@ -594,7 +661,7 @@ class CopilotBase(ABC):
                 f"You are a helpful data assistant for an industrial company that specialises in automotive metal manufacturing.\n\n"
             ),
             self.system_message(
-                f"here is the related documentation used in the company: {self.get_related_documentation}\n\n"
+                f"here is the related documentation used in the company: {self.get_related_documentation(question)}\n\n"
             ),
             self.system_message(
                 f"The user asked the question: '{question}'\n\nThe following is a pandas DataFrame with the results of the query: \n{df.to_markdown()}\n\n"
@@ -604,12 +671,8 @@ class CopilotBase(ABC):
                 self._response_language()
             ),
         ]
-
-        summary = self.submit_prompt(message_log, **kwargs)
-        summary_html = markdown.markdown(summary)
-        summary_sanitized = self._sanitize_html(summary_html, 7)
-        self.log(summary_sanitized, "Generated Summary:")
-        return summary_sanitized
+        for chunk in self.submit_prompt_stream(message_log):
+            yield chunk
 
     # ----------------- Use Any Embeddings API ----------------- #
     @abstractmethod
@@ -740,7 +803,7 @@ class CopilotBase(ABC):
         pass
 
     @abstractmethod
-    def tool_call(self, call_id, call_type, function_name, function_args):
+    def tool_call(self, call_id, function_name, function_args):
         pass
 
     @abstractmethod
@@ -809,7 +872,7 @@ class CopilotBase(ABC):
             ddl_list: list = None,
             doc_list: list = None,
             **kwargs,
-    ):
+    ) -> list:
         """
 
         This method is used to generate a prompt for the LLM to generate SQL.
@@ -969,6 +1032,17 @@ class CopilotBase(ABC):
 
         return plotly_code
 
+    def _sanitize_vega_code(self, raw_vega_code: str) -> str:
+        """
+        - Drops any bare 'chart' or 'chart.show()' at the end of the snippet.
+        - Ensures the snippet ends in a chart binding for .to_dict().
+        """
+        lines = raw_vega_code.strip().splitlines()
+        # drop trailing 'chart' or 'chart.show()'
+        while lines and lines[-1].strip() in {"chart", "chart.show()"}:
+            lines.pop()
+        return "\n".join(lines) + "\n"
+
     def generate_plotly_code(
             self, question: str = None, sql: str = None, df_metadata: str = None, **kwargs
     ) -> str:
@@ -999,6 +1073,80 @@ class CopilotBase(ABC):
 
         final_code = self._sanitize_plotly_code(self._extract_python_code(plotly_code))
         return final_code
+
+    def generate_vega_code(self, question: str = None, sql: str = None, df: pd.DataFrame = None, error: dict = None):
+
+        system_msg = "You are an expert in Python and the Altair data visualization library.",
+        "Your task is to generate Python code that defines an Altair chart object.",
+        "The chart will be rendered in Grafana, which will provide the data.",
+        "The Python code should assign the Altair chart object to a variable named `chart`.",
+        "Do NOT include any data loading (e.g., pandas.read_csv) or `chart.show()` calls.",
+        "The chart should be defined to expect data, e.g., `alt.Chart().mark_...` not `alt.Chart(my_dataframe)...`.",
+        "Use `alt.X`, `alt.Y`, `alt.Color`, etc., for encoding definitions.",
+        "Ensure field names in encodings exactly match the provided column names.",
+        "Make the chart interactive using `.interactive()`.",
+
+        if question is not None:
+            system_msg = f"The user asked the following question: '{question}'"
+        if sql is not None:
+            system_msg += f"\n\nThe DataFrame was produced using this Duckdb SQL query: {sql}\n\n"
+        if df is not None:
+            system_msg += f"\n\nThis is a sample of the data inside the dataframe: {df.head(10)}\n\n"
+
+        message_log = [
+            self.system_message(system_msg),
+            self.user_message(
+                "Generate a Python script to chart the results of the dataframe."
+                "you may only use Altair Vega library to generate the charts"
+                "Choose the most meaningful chart that can help answering the question using the resulting dataframe."
+                "Assume the data is in a pandas dataframe called 'df'."
+                "If there is only one value in the dataframe, use an Indicator."
+                "Respond with only Python code. Do not answer with any explanations -- just the code."
+            ),
+        ]
+
+        if error is not None and 'generated_code' in list(error.keys()) and 'error' in list(error.keys()):
+            message_log.append(self.assistant_message(message=error['generated_code']))
+            message_log.append(self.user_message(
+                message=f"i tried executing your code but i got the following error:\n{error['error']}"))
+
+        vega_code = self.submit_prompt(message_log)
+        print("generated code: \n", vega_code)
+        self.log(title="Generated vega Code", message=vega_code)
+        final_code = self._sanitize_vega_code(self._extract_python_code(vega_code))
+        return final_code
+
+    def get_vega_spec(self, question: str = None, sql: str = None, df: pd.DataFrame = None) -> dict:
+        """
+        Execs the generated Altair code and returns the Vega-Lite spec JSON.
+        """
+        # locals dict: give exec access to df and alt
+        ldict = {"df": df, "alt": __import__("altair")}
+        error = {}
+        for i in range(3):
+
+            code = self.generate_vega_code(
+                question=question,
+                sql=sql,
+                df=df.head(5),
+                error=error
+            )
+            error['generated_code'] = code
+
+            try:
+                exec(code, globals(), ldict)
+                chart = ldict.get("chart", None)
+                continue
+            except Exception as e:
+                error['error'] = f'{e}'
+                raise RuntimeError("error generating the vega chart: ", e)
+
+        if chart is None:
+            raise RuntimeError("No Altair chart produced by vega_code")
+
+        print("the returned chart:\n", chart)
+        # Return the Vega-Lite spec as a dict
+        return chart
 
     def generate_common_plotly(self, df: pd.DataFrame) -> str:
 
@@ -1080,23 +1228,31 @@ if len(unique_values) == 1:
             raise ValidationError(f"Failed to create DuckDB connection: {e}")
 
         attach_str = f"hostaddr={host} dbname={dbname} user={user} password={password} port={port}"
+        cursor = self.con.cursor()
         try:
-            self.con.sql(f"ATTACH '{attach_str}' AS pg (TYPE postgres, SCHEMA 'public');")
+            cursor.sql(f"ATTACH '{attach_str}' AS pg (TYPE postgres, SCHEMA 'public');")
+
         except Exception as e:
+            cursor.close()
             raise ValidationError(f"Failed to attach PostgreSQL database: {e}")
 
         try:
-            table_list = self.con.sql("""select * from information_schema.tables""")["table_name"].fetchall()
+            table_list = cursor.sql("""select * from information_schema.tables""")["table_name"].fetchall()
             for table in table_list:
-                self.con.sql(f"CREATE OR REPLACE VIEW {table[0]} AS SELECT * FROM pg.public.{table[0]}")
+                cursor.sql(f"CREATE OR REPLACE VIEW {table[0]} AS SELECT * FROM pg.public.{table[0]}")
+
         except Exception as e:
+            cursor.close()
             raise ValidationError("couldn't create views for postgresql in duckdb")
 
         def run_sql_duckdb(sql: str) -> pd.DataFrame:
             try:
                 # DuckDB's .df() method converts the query result to a pandas DataFrame.
-                return self.con.sql(sql).df()
+                df = cursor.sql(sql).df()
+                cursor.close()
+                return df
             except Exception as e:
+                cursor.close()
                 raise ValidationError(f"SQL execution error: {e}")
 
         # Set properties on self for later usage
@@ -1302,65 +1458,46 @@ if len(unique_values) == 1:
 
     def get_training_plan_generic(self, df) -> TrainingPlan:
         """
-        This method is used to generate a training plan from an information schema dataframe.
+        Generate a TrainingPlan from a DataFrame with columns:
+          - table_name
+          - column_name
+          - data_type
+          - (optional) comment
 
-        Basically what it does is breaks up INFORMATION_SCHEMA.COLUMNS into groups of table/column descriptions that can be used to pass to the LLM.
-
-        Args:
-            df (pd.DataFrame): The dataframe to generate the training plan from.
-
-        Returns:
-            TrainingPlan: The training plan.
+        Groups only by table_name and emits one plan item per table.
         """
-        # For each of the following, we look at the df columns to see if there's a match:
-        database_column = df.columns[
-            df.columns.str.lower().str.contains("database")
-            | df.columns.str.lower().str.contains("table_catalog")
-            ].to_list()[0]
-        schema_column = df.columns[
-            df.columns.str.lower().str.contains("table_schema")
-        ].to_list()[0]
-        table_column = df.columns[
-            df.columns.str.lower().str.contains("table_name")
-        ].to_list()[0]
-        columns = [database_column,
-                   schema_column,
-                   table_column]
-        candidates = ["column_name",
-                      "data_type",
-                      "comment"]
-        matches = df.columns.str.lower().str.contains("|".join(candidates), regex=True)
-        columns += df.columns[matches].to_list()
+
+        # 1) sanity check
+        if 'table_name' not in df.columns:
+            raise ValueError("DataFrame must have a 'table_name' column")
+
+        # 2) pick up whichever of column_name/data_type/comment exist
+        detail_cols = [c for c in ('column_name', 'data_type', 'comment') if c in df.columns]
+
+        # 3) these are the columns we’ll include in the markdown
+        cols = ['table_name'] + detail_cols
 
         plan = TrainingPlan([])
 
-        for database in df[database_column].unique().tolist():
-            for schema in (
-                    df.query(f'{database_column} == "{database}"')[schema_column]
-                            .unique()
-                            .tolist()
-            ):
-                for table in (
-                        df.query(
-                            f'{database_column} == "{database}" and {schema_column} == "{schema}"'
-                        )[table_column]
-                                .unique()
-                                .tolist()
-                ):
-                    df_columns_filtered_to_table = df.query(
-                        f'{database_column} == "{database}" and {schema_column} == "{schema}" and {table_column} == "{table}"'
-                    )
-                    doc = f"The following columns are in the table named '{table} ':\n\n"
-                    doc += df_columns_filtered_to_table[columns].to_markdown()
+        # 4) for each table, build the doc and append a plan item
+        for table in df['table_name'].unique():
+            df_sub = df[df['table_name'] == table]
 
-                    plan._plan.append(
-                        TrainingPlanItem(
-                            item_type=TrainingPlanItem.ITEM_TYPE_IS,
-                            item_group=f"{database}.{schema}",
-                            item_name=table,
-                            item_value=doc,
-                        )
-                    )
+            # build the markdown: e.g.
+            # The following columns are in the table named 'users':
+            #
+            # | table_name | column_name | data_type |
+            doc = f"The following columns are in the table named '{table}':\n\n"
+            doc += df_sub[cols].to_markdown(index=False)
+
+            plan._plan.append(
+                TrainingPlanItem(
+                    item_type=TrainingPlanItem.ITEM_TYPE_IS,
+                    item_group=table,  # you can also set "" or a fixed value here
+                    item_name=table,
+                    item_value=doc,
+                )
+            )
 
         return plan
 

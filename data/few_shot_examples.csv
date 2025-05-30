@@ -933,4 +933,3 @@ What are the distinct error types from the errors table whose time intervals ove
 )
 SELECT err
 FROM overlapping_errors;"
-question,content

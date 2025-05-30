@@ -6,11 +6,14 @@ import sys
 import uuid
 import hashlib
 import time
+import threading
+import queue
 from abc import ABC, abstractmethod
 from functools import wraps
 import importlib.metadata
 import markdown
 import re
+import sqlite3
 
 import pandas as pd
 import duckdb
@@ -18,13 +21,14 @@ import flask
 from flask_cors import CORS
 import requests
 from flasgger import Swagger
-from flask import Flask, Response, jsonify, request, send_from_directory, session, make_response, flash
+from flask import Flask, Response, jsonify, request, send_from_directory, session, make_response, flash, g
 from werkzeug.utils import secure_filename
 from flask_sock import Sock
 
 from webApp.base.base import CopilotBase
 from webApp.assets import *
 from webApp.auth import AuthInterface, NoAuth
+from webApp.base.cache_types import CacheTypes
 from constants import tmp_file_dir
 
 
@@ -48,7 +52,7 @@ class Cache(ABC):
         pass
 
     @abstractmethod
-    def get_all(self, field_list) -> list:
+    def get_all(self) -> list:
         """
         Get all values from the cache.
         """
@@ -91,12 +95,11 @@ class MemoryCache(Cache):
 
         return self.cache[id][field]
 
-    def get_all(self, field_list) -> list:
-        return [
-            {"id": id, "name": "this is a mock title", "created_at": time.time(),
-             **{field: self.get(id=id, field=field) for field in field_list}}
-            for id in self.cache
-        ]
+    def get_all(self):
+        print(self.cache)
+        print(self.cache.keys())
+        print(self.cache.values())
+        return jsonify({'content': "self.cache"})
 
     def delete(self, id):
         if id in self.cache:
@@ -178,15 +181,20 @@ class FlaskAPI:
         """
 
         self.flask_app = Flask(__name__)
+
+        # Register CORS for your API
         CORS(
             self.flask_app,
             supports_credentials=True,
-            resources={
-                r"/api/*": {
-                    "origins": "http://localhost:3001"
-                }
-            }
+            resources={r"/api/*": {"origins": ["http://192.168.7.99:3001", 'http://localhost:3001']}}
         )
+
+        # Setup teardown for request‑scoped DB
+        @self.flask_app.teardown_appcontext
+        def close_db_conn(exc):
+            conn = g.pop('db_conn', None)
+            if conn:
+                conn.close()
 
         self.swagger = Swagger(
             self.flask_app, template={"info": {"title": "Copilot API"}}
@@ -244,6 +252,10 @@ class FlaskAPI:
                 }
             )
 
+        @self.flask_app.route("/api/v0/get_cache", methods=["GET"])
+        def get_cache():
+            return self.cache.get_all()
+
         @self.flask_app.route("/api/v0/generate_questions", methods=["GET"])
         @self.requires_auth
         def generate_questions(user: any):
@@ -269,7 +281,7 @@ class FlaskAPI:
                       type: string
                       default: Here are some questions you can ask
             """
-
+            print("start")
             training_data = copilot.get_training_data()
 
             # If training data is None or empty
@@ -302,6 +314,7 @@ class FlaskAPI:
                     }
                 )
             except Exception as e:
+                print("error: ", e)
                 return jsonify(
                     {
                         "type": "question_list",
@@ -384,7 +397,7 @@ class FlaskAPI:
         def get_uploaded_spreadsheets():
             """
             Reads only CSV and Excel files from a directory whose filenames contain
-            the session_id stored in Flask cookies.
+            the session ID stored in Flask cookies.
 
             Parameters:
                 dir_path (str): Path to the directory containing the files.
@@ -484,6 +497,71 @@ class FlaskAPI:
                         print(f"Error deleting file '{file}': {e}")
             return jsonify({"type": "text", "text": "deleted successfully"}), 200
 
+        @self.flask_app.route("/api/v0/create_conversation_contextual", methods=["POST"])
+        def create_conversation_contextual():
+            """
+            Create a new conversation with contextual tool information.
+            ---
+            parameters:
+              - name: body
+                in: body
+                required: true
+                schema:
+                  type: object
+                  properties:
+                    user_question:
+                      type: string
+                      description: The initial question from the user.
+                    user_id:
+                      type: string
+                      description: The ID of the user.
+            responses:
+              200:
+                description: Conversation created successfully
+                schema:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      default: success
+                    conversation_id:
+                      type: string
+              400:
+                description: Bad request (e.g., missing user_question or user_id)
+              500:
+                description: Internal server error
+            """
+            if not request.json:
+                print("Request body must be JSON for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
+
+            user_question = request.json.get("user_question")
+            print(request.json)
+            user_id = request.json.get("user_id", 'empty')
+            conversation_id = request.json.get("conversation_id")
+
+            if not user_question:
+                print("Missing user_question in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "user_question is required"}), 400
+            if not user_id:
+                print("Missing user_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "user_id is required"}), 400
+
+            try:
+                dfs = get_uploaded_spreadsheets()
+                # Call the modified create_new_conversation method from CopilotBase instance
+                conversation_id = self.copilot.create_new_conversation(user_question=user_question,
+                                                                       user_id=str(user_id),
+                                                                       dfs=dfs
+                                                                       )
+                print(f"Successfully created conversation_id: {conversation_id} via /create_conversation_contextual")
+                return jsonify({"type": "success", "conversation_id": conversation_id}), 200
+            except Exception as e:
+                # Ensure traceback is imported in FlaskApp.py if not already
+                tb_str = traceback.format_exc()
+                print(f"Error in /create_conversation_contextual: {e}\n{tb_str}", "Error")
+                return jsonify({"type": "error", "error": "Failed to create conversation", "details": str(e)}), 500
+
         @self.flask_app.route("/api/v0/generate_sql", methods=["GET", "POST"])
         @self.requires_auth
         def generate_sql(user: any):
@@ -511,23 +589,28 @@ class FlaskAPI:
                       type: string
             """
 
-            question = flask.request.args.get("question")
-            user_id = flask.request.cookies.get("session_id")
+            if not request.json:
+                print("Request body must be JSON for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
 
-            if question is None or question == "":
-                return jsonify({"type": "error", "error": "No question provided"})
+            conversation_id = request.json.get("conversation_id")
+            question = request.json.get("question")
+            user_id = request.json.get("user_id", "empty")
 
-            dfs = get_uploaded_spreadsheets()
+            if not conversation_id:
+                print("Missing conversation_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
 
-            conversation_id = self.cache.generate_id(question=question)
+            if not user_id:
+                print("Missing user_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "user_id is required"}), 400
 
-            sql = copilot.generate_sql(question=question, allow_llm_to_see_data=self.allow_llm_to_see_data, dfs=dfs,
-                                       user_id=user_id, conversation_id=conversation_id)
+            sql = self.copilot.generate_sql(user_id=user_id, conversation_id=conversation_id, )
 
-            self.cache.set(id=conversation_id, field="question", value=question)
-            self.cache.set(id=conversation_id, field="sql", value=sql)
+            self.cache.set(id=conversation_id, field=CacheTypes.QUESTION, value=question)
+            self.cache.set(id=conversation_id, field=CacheTypes.SQL, value=sql)
 
-            if copilot.is_sql_valid(sql=sql):
+            if self.copilot.is_sql_valid(sql=sql):
                 return jsonify(
                     {
                         "type": "sql",
@@ -612,13 +695,13 @@ class FlaskAPI:
                 self.copilot.log(f"No instantiated SQL found for {question} in {function}")
                 return jsonify({"type": "error", "error": "No instantiated SQL found"})
 
-            self.cache.set(id=id, field="question", value=question)
-            self.cache.set(id=id, field="sql", value=function['instantiated_sql'])
+            self.cache.set(id=id, field=CacheTypes.QUESTION, value=question)
+            self.cache.set(id=id, field=CacheTypes.SQL, value=function['instantiated_sql'])
 
             if 'instantiated_post_processing_code' in function and function[
                 'instantiated_post_processing_code'] is not None and len(
                 function['instantiated_post_processing_code']) > 0:
-                self.cache.set(id=id, field="plotly_code", value=function['instantiated_post_processing_code'])
+                self.cache.set(id=id, field=CacheTypes.PLOTLY_CODE, value=function['instantiated_post_processing_code'])
 
             return jsonify(
                 {
@@ -660,38 +743,29 @@ class FlaskAPI:
                 }
             )
 
-        @self.flask_app.route("/api/v0/run_sql", methods=["GET"])
-        @self.requires_auth
-        @self.requires_cache(["sql"])
-        def run_sql(user: any, id: str, sql: str):
-            """
-            Run SQL
-            ---
-            parameters:
-              - name: user
-                in: query
-              - name: id
-                in: query|body
-                type: string
-                required: true
-            responses:
-              200:
-                schema:
-                  type: object
-                  properties:
-                    type:
-                      type: string
-                      default: df
-                    id:
-                      type: string
-                    df:
-                      type: object
-                    should_generate_chart:
-                      type: boolean
-            """
+        @self.flask_app.route("/api/v0/run_sql", methods=["POST"])
+        def run_sql():
 
             attempt = 0
             last_error = None
+
+            if not request.json:
+                print("Request body must be JSON for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
+
+            conversation_id = request.json.get("conversation_id")
+            sql = request.json.get("sql")
+            user_id = request.cookies.get("session_id", "empty")
+
+            if not conversation_id:
+                print("Missing conversation_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
+            # if not user_id:
+            #     print("Missing user_id in request for /create_conversation_contextual", "Error")
+            #     return jsonify({"type": "error", "error": "user_id is required"}), 400
+            if not sql:
+                print("Missing sql in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "sql is required"}), 400
 
             if not self.copilot.run_sql_is_set:
                 return jsonify({
@@ -699,23 +773,22 @@ class FlaskAPI:
                     "error": "Please connect to a database using copilot.connect_to_... in order to run SQL queries."
                 })
 
-            # uncomment if the uploading logic dont work
-            # dfs = get_uploaded_spreadsheets()
-            # if len(dfs) >= 1:
-            #     for i, df in enumerate(dfs):
-            #         self.copilot.con.sql(f"""CREATE OR REPLACE TEMP TABLE table{i} AS SELECT * FROM df;""")
+            dfs = get_uploaded_spreadsheets()
+            if len(dfs) >= 1:
+                for i, df in enumerate(dfs):
+                    self.copilot.con.sql(f"""CREATE OR REPLACE TEMP TABLE table{i} AS SELECT * FROM df;""")
 
             while attempt < self.max_attempts:
                 try:
                     df_returned = self.copilot.con.sql(query=sql).df()
 
-                    self.cache.set(id=id, field="df", value=df_returned)
-                    self.cache.set(id=id, field="sql", value=sql)
+                    self.cache.set(id=conversation_id, field=CacheTypes.DF, value=df_returned)
+                    self.cache.set(id=conversation_id, field=CacheTypes.SQL, value=sql)
 
                     return jsonify({
                         "type": "df",
-                        "id": id,
-                        "df": df_returned.head(10).to_json(orient='records', date_format='iso'),
+                        "id": conversation_id,
+                        "df": df_returned.head(100).to_json(orient='records', date_format='iso'),
                         "should_generate_chart": self.chart and copilot.should_generate_chart(df_returned),
                     })
                 except Exception as e:
@@ -723,17 +796,19 @@ class FlaskAPI:
                     attempt += 1
 
                     if attempt < self.max_attempts:
-                        original_question = self.cache.get(id, "question")
+                        original_question = self.cache.get(conversation_id, CacheTypes.QUESTION)
                         fix_question = f"I have an error: {last_error}\n\nHere is the SQL I tried to run: {sql}\n\nThis is the question I was trying to answer: {original_question}\n\nCan you rewrite the SQL to fix the error?"
 
                         print(f"error in Generated SQL, Fixing the SQL, Attempt:{attempt}/{self.max_attempts}")
-                        sql = copilot.generate_sql(question=fix_question, dfs=dfs)
+                        sql = self.copilot.generate_sql(conversation_id=conversation_id, user_id=user_id)
 
-                        self.cache.set(id=id, field="sql", value=sql)
+                        self.cache.set(id=conversation_id, field=CacheTypes.SQL, value=sql)
                     else:
                         print(traceback.format_exc())
                         return jsonify({"type": "sql_error",
                                         "error": f"The Copilot tried fixing the error for {max_attempts} times but didn't succeed."})
+                finally:
+                    self.copilot.insert_message_db(conversation_id, user_id, "assistant", extracted_sql=sql)
 
         @self.flask_app.route("/api/v0/fix_sql", methods=["POST"])
         @self.requires_auth
@@ -777,7 +852,7 @@ class FlaskAPI:
 
             fixed_sql = copilot.generate_sql(question=question, dfs=dfs)
 
-            self.cache.set(id=id, field="sql", value=fixed_sql)
+            self.cache.set(id=id, field=CacheTypes.SQL, value=fixed_sql)
 
             return jsonify(
                 {
@@ -788,9 +863,7 @@ class FlaskAPI:
             )
 
         @self.flask_app.route('/api/v0/update_sql', methods=['POST'])
-        @self.requires_auth
-        @self.requires_cache([])
-        def update_sql(user: any, id: str):
+        def update_sql():
             """
             Update SQL
             ---
@@ -818,17 +891,28 @@ class FlaskAPI:
                     text:
                       type: string
             """
+
+            if not request.json:
+                print("Request body must be JSON for /update_sql", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
+
             sql = flask.request.json.get('sql')
+            conversation_id = flask.request.json.get('conversation_id')
 
-            if sql is None:
-                return jsonify({"type": "error", "error": "No sql provided"})
+            if not conversation_id:
+                print("Missing conversation_id in request for /update_sql", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
 
-            self.cache.set(id=id, field='sql', value=sql)
+            if not sql:
+                print("Missing sql in request for /update_sql", "Error")
+                return jsonify({"type": "error", "error": "sql is required"}), 400
+
+            self.cache.set(id=conversation_id, field=CacheTypes.SQL, value=sql)
 
             return jsonify(
                 {
                     "type": "sql",
-                    "id": id,
+                    "id": conversation_id,
                     "text": sql,
                 })
 
@@ -858,73 +942,128 @@ class FlaskAPI:
                 headers={"Content-disposition": f"attachment; filename={id}.csv"},
             )
 
-        @self.flask_app.route("/api/v0/generate_plotly_figure", methods=["GET"])
-        @self.requires_auth
-        @self.requires_cache(["df", "question", "sql"])
-        def generate_plotly_figure(user: any, id: str, df: pd.DataFrame, question, sql):
-            """
-            Generate plotly figure
-            ---
-            parameters:
-              - name: user
-                in: query
-              - name: id
-                in: query|body
-                type: string
-                required: true
-              - name: chart_instructions
-                in: body
-                type: string
-            responses:
-              200:
-                schema:
-                  type: object
-                  properties:
-                    type:
-                      type: string
-                      default: plotly_figure
-                    id:
-                      type: string
-                    fig:
-                      type: object
-            """
-            chart_instructions = flask.request.args.get('chart_instructions')
+        @self.flask_app.route("/api/v0/generate_vega_chart", methods=["GET"])
+        def generate_vega_chart():
+
+            user_id = flask.request.cookies.get("session_id")
+
+            if not user_id:
+                return jsonify({
+                    'type': 'error',
+                    'error': "please provide the user_id"
+                })
+
+            question = flask.request.args.get("question", None)
+            if not question:
+                return jsonify({
+                    'type': 'error',
+                    'error': "please provide the question asked by the user."
+                })
+
+            sql = flask.request.args.get("sql", None)
+            if not sql:
+                return jsonify({
+                    'type': 'error',
+                    'error': "please provide the SQL query generated."
+                })
+            # chart_instructions = flask.request.args.get('chart_instructions')
+            df = self.copilot.con.sql(sql).df()
             try:
-                code = copilot.generate_common_plotly(df)
+                # # Try any shortcut first (if you have common‐vega snippets)
+                # code = copilot.generate_common_vega(df)
+                # if not code:
+                #     # build LLM prompt if no common snippet or user overrides
+                #     instr = f". When generating the chart, use these special instructions: {chart_instructions}" if chart_instructions else ""
+                #     prompt_question = f"{question}{instr}"
+
+                # Execute and extract the Altair Chart object
+                spec = self.copilot.get_vega_spec(question, sql, df)
+
+                self.cache.set(id=user_id, field=CacheTypes.SPEC_JSON, value=spec)
+
+                return jsonify({
+                    "type": "vega_spec",
+                    "spec": spec,
+                })
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return jsonify({"type": "error", "error": str(e)})
+
+        @self.flask_app.route("/api/v0/generate_plotly_figure", methods=["POST"])
+        def generate_plotly_figure():
+
+            if not request.json:
+                print("Request body must be JSON for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
+
+            user_id = request.cookies.get("session_id", "empty")
+            conversation_id = request.json.get("conversation_id")
+            sql = request.json.get("sql")
+            question = flask.request.json.get("question", None)
+
+            if not user_id:
+                print("Missing user_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "user_id is required"}), 400
+            if not conversation_id:
+                print("Missing conversation_id in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
+            if not sql:
+                print("Missing sql in request for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "sql is required"}), 400
+            if not question:
+                return jsonify({'type': 'error', 'error': "please provide the question asked by the user."}), 400
+
+            fig_json = self.cache.get(id=conversation_id, field=CacheTypes.FIG_JSON)
+            if fig_json:
+                return jsonify(
+                    {
+                        "type": "plotly_figure",
+                        "fig": fig_json,
+                    }
+                )
+
+            chart_instructions = flask.request.args.get('chart_instructions')
+            print("chart instructions:", chart_instructions)
+            df = self.cache.get(conversation_id, CacheTypes.DF)
+            try:
+                code = ""
+                if chart_instructions is None or len(chart_instructions) == 0:
+                    code = self.copilot.generate_common_plotly(df)
+
                 if code == "" and (chart_instructions is None or len(chart_instructions) == 0):
                     code = copilot.generate_plotly_code(
                         question=question,
                         sql=sql,
                         df_metadata=f"Running df.dtypes gives:\n {df.dtypes}",
-                        df_sample=df.head(3)
+                        df_sample=df.head(5)
                     )
-                    self.cache.set(id=id, field="plotly_code", value=code)
+                    self.cache.set(id=id, field=CacheTypes.PLOTLY_CODE, value=code)
                 elif code == "":
                     question = f"{question}. When generating the chart, use these special instructions: {chart_instructions}"
                     code = copilot.generate_plotly_code(
                         question=question,
                         sql=sql,
                         df_metadata=f"Running df.dtypes gives:\n {df.dtypes}",
-                        df_sample=df.head(3)
+                        df_sample=df.head(5)
                     )
-                    self.cache.set(id=id, field="plotly_code", value=code)
+                    self.cache.set(id=id, field=CacheTypes.PLOTLY_CODE, value=code)
 
                 fig = copilot.get_plotly_figure(plotly_code=code, df=df, dark_mode=False)
                 fig_json = fig.to_json()
-
-                self.cache.set(id=id, field="fig_json", value=fig_json)
+                print("the plotly json:", fig_json)
+                self.cache.set(id=conversation_id, field=CacheTypes.FIG_JSON, value=fig_json)
 
                 return jsonify(
                     {
                         "type": "plotly_figure",
-                        "id": id,
                         "fig": fig_json,
                     }
                 )
             except Exception as e:
                 # Print the stack trace
                 import traceback
-
                 traceback.print_exc()
 
                 return jsonify({"type": "error", "error": str(e)})
@@ -952,8 +1091,7 @@ class FlaskAPI:
                     df:
                       type: object
             """
-            df = copilot.get_training_data()
-            copilot.get_tables_to_use()
+            df = self.copilot.get_training_data()
             if df is None or len(df) == 0:
                 return jsonify(
                     {
@@ -1004,106 +1142,315 @@ class FlaskAPI:
                     {"type": "error", "error": "Couldn't remove training data"}
                 )
 
-        @self.flask_app.route("/api/v0/run_agent", methods=["POST"])
-        def run_agent_endpoint() -> any:
-            data = request.get_json()
-            question = data.get("question")
-            if not question:
-                return jsonify({"error": "Missing 'question' in request body."}), 400
+        @self.flask_app.route("/api/v0/api/stream_answer", methods=["GET"])
+        def stream_answer():
 
-            user_id = flask.request.cookies.get("session_id")
-            thread_id = data.get("thread_id") or None  # Ensure it's None if empty
-            print("cookies: ",flask.request.cookies.to_dict())
-            print("thread_id from request: ", thread_id)
-            print("user_id: ", user_id)
-            
-            # Use the new method to get or create a conversation ID
-            # This preserves None values which trigger _build_initial_messages later
-            conversation_id = self.copilot.get_or_create_conversation_id(thread_id, user_id, question)
-            
-            # Store task info in cache for status endpoint and streaming
-            self.cache.set(conversation_id, "status", "UNDERSTANDING")
-            self.cache.set(conversation_id, "type", "TEXT_TO_SQL")
-            self.cache.set(conversation_id, "question", question)
-            self.cache.set(conversation_id, "user_id", user_id)
-            self.cache.set(conversation_id, "thread_id", thread_id)  # Store original thread_id if any
-            
-            # Return initial response with queryId to start the process
-            return jsonify({
-                "askingTask": {
-                    "queryId": conversation_id,
-                    "status": "UNDERSTANDING",
-                    "type": "TEXT_TO_SQL",
-                    "question": question,
-                    "retrievedTables": [],
-                    "sqlGenerationReasoning": ""
-                }
-            })
-            
-        @self.flask_app.route("/api/v0/api/ask_task/streaming", methods=["GET"])
-        def streaming_endpoint():
-            query_id = request.args.get('queryId')
-            if not query_id:
-                return jsonify({"error": "Missing queryId parameter"}), 400
-                
-            # Get stored info from cache
-            question = self.cache.get(query_id, "question")
-            user_id = self.cache.get(query_id, "user_id")
-            thread_id = self.cache.get(query_id, "thread_id")  # Get original thread_id if any
-            
-            if not question or not user_id:
-                return jsonify({"error": "Invalid queryId or missing data"}), 404
-                
-            # Update status to SEARCHING
-            self.cache.set(query_id, "status", "SEARCHING")
-            
-            # Use the streaming method from LLM integration
-            # Important: We pass thread_id here, which might be None
-            # This preserves the correct conversation creation logic
-            def generate():
-                # Pass iterator results from stream_response to the client
-                for response in self.copilot.stream_response(question, user_id, thread_id):
-                    yield f"data: {response}\n\n"
-                    
-                    # Parse response to extract message and done status
-                    try:
-                        response_data = json.loads(response)
-                        if response_data.get('done', False):
-                            # Update status to FINISHED when done
-                            self.cache.set(query_id, "status", "FINISHED")
-                    except json.JSONDecodeError:
-                        pass
-                    
-            return Response(generate(), mimetype='text/event-stream')
-            
+            user_id = request.cookies.get("session_id", "empty")
+            conversation_id = request.args.get("conversation_id")
+
+            if not user_id:
+                print("Missing user_id in request for /handle_streaming", "Error")
+                return jsonify({"type": "error", "error": "user_id is required"}), 400
+            if not conversation_id:
+                print("Missing conversation_id in request for /handle_streaming", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
+
+            summary_answer = self.cache.get(conversation_id, CacheTypes.SUMMARY_ANSWER)
+            sql = self.cache.get(conversation_id, CacheTypes.SQL)
+            question = self.cache.get(conversation_id, CacheTypes.QUESTION)
+            df = self.cache.get(conversation_id, CacheTypes.DF)
+
+            if summary_answer:
+                def generate_cached():
+                    data = {'content': summary_answer, 'done': True}
+                    yield f"data: {json.dumps(data)}\n\n"
+
+                return Response(generate_cached(), mimetype='text/event-stream')
+
+            def generate_stream_response():
+                try:
+                    for chunk_content in self.copilot.generate_summary(question=question, sql=sql, df=df):
+                        response_chunk = f"data: {json.dumps({'content': chunk_content, 'done': False})}\n\n"
+                        yield response_chunk
+                    yield f"data: {json.dumps({'done': True})}\n\n"
+                    self.cache.set(id=conversation_id, field=CacheTypes.SUMMARY_ANSWER, value=None)
+                except ValueError as ve:  # Catch prompt validation errors specifically
+                    print(f"Validation error for streaming request: {ve}")
+                    yield f"data: {json.dumps({'error': str(ve), 'done': True})}\n\n"
+                except Exception as e:
+                    print(f"Error during streaming generation: {e}")
+                    yield f"data: {json.dumps({'error': 'An error occurred during streaming.', 'done': True})}\n\n"
+
+            return Response(generate_stream_response(), mimetype='text/event-stream')
+
+        # @self.flask_app.route("/api/v0/run_agent", methods=["POST"])
+        # def run_agent_endpoint() -> any:
+        #     data = request.get_json()
+        #     question = data.get("question")
+        #     if not question:
+        #         return jsonify({"error": "Missing 'question' in request body."}), 400
+        #
+        #     user_id = "userid_12335"
+        #     thread_id = data.get("thread_id") or None
+        #     print("cookies: ", flask.request.cookies.to_dict())
+        #     print(f"run_agent: question='{question}', user_id='{user_id}', thread_id='{thread_id}'")
+        #
+        #     messages, conversation_id = self.copilot.create_or_load_conversation(thread_id, user_id, question)
+        #     print(f"run_agent: Created conversation_id='{conversation_id}'")
+        #
+        #     # output_queue = queue.Queue()
+        #     #
+        #     # def stream_worker(q_out, qst, usr_id, conv_id):
+        #     #     worker_log_prefix = f"Worker {conv_id}:"
+        #     #     print(f"{worker_log_prefix} Starting.")
+        #     #     try:
+        #     #         # cancel_requested flag is initialized by run_agent_endpoint
+        #     #
+        #     #         for response_item in self.copilot.stream_response(qst, usr_id, conv_id):
+        #     #             if self.cache.get(conv_id, "cancel_requested"):
+        #     #                 cached_status_on_cancel_detect = self.cache.get(conv_id, 'status')
+        #     #                 print(
+        #     #                     f"{worker_log_prefix} Detected cancel_requested. Current status in cache: {cached_status_on_cancel_detect}")
+        #     #                 self.cache.set(conv_id, "status", "CANCELLED")  # Set status FIRST
+        #     #                 print(f"{worker_log_prefix} Set status to CANCELLED in cache.")
+        #     #                 q_out.put(json.dumps({
+        #     #                     "message": "Task cancelled by user.",
+        #     #                     "done": True,
+        #     #                     "cancelled": True,
+        #     #                     "queryId": conv_id
+        #     #                 }))
+        #     #                 q_out.put(None)
+        #     #                 print(f"{worker_log_prefix} Signalled cancellation and end of stream.")
+        #     #                 return
+        #     #
+        #     #             q_out.put(response_item)
+        #     #
+        #     #         # If loop completes without cancellation
+        #     #         if not self.cache.get(conv_id, "cancel_requested"):
+        #     #             print(f"{worker_log_prefix} Natural completion of stream_response. Signalling end.")
+        #     #             # The streaming_endpoint or last message should handle setting FINISHED status.
+        #     #             # Worker ensures None is sent.
+        #     #             q_out.put(None)
+        #     #
+        #     #     except Exception as e:
+        #     #         if self.cache.get(conv_id, "cancel_requested"):
+        #     #             print(
+        #     #                 f"{worker_log_prefix} Error during cancellation process: {e}. Status should already be CANCELLED or CANCELLING.")
+        #     #             if self.cache.get(conv_id, "status") != "CANCELLED":
+        #     #                 self.cache.set(conv_id, "status", "CANCELLED")
+        #     #             q_out.put(json.dumps({
+        #     #                 "message": f"Task cancelled, error during shutdown: {e}",
+        #     #                 "done": True, "cancelled": True, "error": True, "queryId": conv_id
+        #     #             }))
+        #     #         else:
+        #     #             print(f"{worker_log_prefix} Error: {e}")
+        #     #             traceback.print_exc()
+        #     #             self.cache.set(conv_id, "status", "ERROR")
+        #     #             self.cache.set(conv_id, "error_message", str(e))
+        #     #             q_out.put(json.dumps({
+        #     #                 "message": f"An error occurred: {e}", "done": True, "error": True, "queryId": conv_id
+        #     #             }))
+        #     #         q_out.put(None)  # Ensure stream termination signal
+        #     #     finally:
+        #     #         print(f"{worker_log_prefix} Exiting. Final Status in cache: {self.cache.get(conv_id, 'status')}")
+        #     #
+        #     # # Before starting thread:
+        #     # self.cache.set(conversation_id, "status", "STREAMING")
+        #     # self.cache.set(conversation_id, "type", "TEXT_TO_SQL")
+        #     # self.cache.set(conversation_id, "question", question)
+        #     # self.cache.set(conversation_id, "user_id", user_id)
+        #     # self.cache.set(conversation_id, "thread_id", thread_id)
+        #     # self.cache.set(conversation_id, "output_queue", output_queue)
+        #     # self.cache.set(conversation_id, "cancel_requested", False)  # Initialize the flag
+        #     #
+        #     # worker_thread = threading.Thread(
+        #     #     target=stream_worker,
+        #     #     args=(output_queue, question, user_id, conversation_id),
+        #     #     daemon=True
+        #     # )
+        #     # worker_thread.start()
+        #     # print(f"run_agent: Worker thread started for conversation_id='{conversation_id}'")
+        #
+        #     return jsonify({
+        #         "askingTask": {
+        #             "queryId": conversation_id, "thread_id": conversation_id, "status": "STREAMING",
+        #             "type": "TEXT_TO_SQL", "question": question,
+        #             "retrievedTables": [], "sqlGenerationReasoning": ""
+        #         }
+        #     })
+        #
+        # @self.flask_app.route("/api/v0/api/ask_task/streaming", methods=["GET"])
+        # def streaming_endpoint():
+        #     conversation_id = request.args.get('query_id')
+        #     stream_log_prefix = f"StreamEP {conversation_id}:"
+        #
+        #     if not conversation_id:
+        #         return jsonify({"error": "Missing queryId parameter"}), 400
+        #
+        #     output_queue = self.cache.get(conversation_id, "output_queue")
+        #
+        #     if not output_queue:
+        #         status = self.cache.get(conversation_id, "status")
+        #         if status == "CANCELLED":
+        #             return jsonify(
+        #                 {"message": "Task was cancelled.", "queryId": conversation_id, "status": "CANCELLED"}), 410
+        #         elif status == "ERROR":
+        #             error_msg = self.cache.get(conversation_id, "error_message") or "Task errored before streaming."
+        #             return jsonify({"error": error_msg, "queryId": conversation_id, "status": "ERROR"}), 500
+        #         return jsonify({"error": "Invalid queryId or task not found/started"}), 404
+        #
+        #     def generate():
+        #         while True:
+        #             try:
+        #                 response = output_queue.get(timeout=1)
+        #             except queue.Empty:
+        #                 cached_status = self.cache.get(conversation_id, "status")
+        #                 cancel_flag = self.cache.get(conversation_id, "cancel_requested")
+        #
+        #                 if cached_status in ["CANCELLED", "ERROR", "FINISHED"]:
+        #                     print(
+        #                         f"{stream_log_prefix} Ending (timeout) as task status in cache is terminal: {cached_status}.")
+        #                     break
+        #                 elif cached_status == "CANCELLING" or (cached_status == "STREAMING" and cancel_flag):
+        #                     continue
+        #                 else:  # STREAMING without cancel flag, or PENDING etc.
+        #                     continue
+        #
+        #             if response is None:
+        #                 cached_status_at_none = self.cache.get(conversation_id, "status")
+        #                 cancel_flag_at_none = self.cache.get(conversation_id, "cancel_requested")
+        #                 error_msg_at_none = self.cache.get(conversation_id, "error_message")
+        #                 # Fallback if worker died without setting a clear final status
+        #                 if cached_status_at_none in ["STREAMING", "CANCELLING", None]:  # None status means not set
+        #                     if cancel_flag_at_none:
+        #                         if cached_status_at_none != "CANCELLED":
+        #                             self.cache.set(conversation_id, "status", "CANCELLED")
+        #                             print(
+        #                                 f"{stream_log_prefix} Status was ambiguous on None, set to CANCELLED due to request flag.")
+        #                     elif error_msg_at_none:  # If an error was logged by worker
+        #                         if cached_status_at_none != "ERROR":
+        #                             self.cache.set(conversation_id, "status", "ERROR")
+        #                             print(
+        #                                 f"{stream_log_prefix} Status was ambiguous on None, set to ERROR due to error_message.")
+        #                     elif cached_status_at_none != "FINISHED":  # Default to FINISHED if no cancel/error
+        #                         self.cache.set(conversation_id, "status", "FINISHED")
+        #                         print(f"{stream_log_prefix} Status was ambiguous on None, set to FINISHED.")
+        #                 break  # Exit generate() loop
+        #
+        #             yield f"data: {response}\n\n"
+        #
+        #             try:
+        #                 response_data = json.loads(response)
+        #                 is_done = response_data.get('done')
+        #                 is_error = response_data.get('error', False)
+        #                 is_cancelled_msg = response_data.get('cancelled', False)
+        #
+        #                 if is_cancelled_msg:
+        #                     if self.cache.get(conversation_id, "status") != "CANCELLED":
+        #                         self.cache.set(conversation_id, "status", "CANCELLED")
+        #
+        #                 elif is_done:
+        #                     status_before_done = self.cache.get(conversation_id, "status")
+        #                     cancel_pending = self.cache.get(conversation_id, "cancel_requested") or \
+        #                                      status_before_done == "CANCELLING"
+        #                     print(
+        #                         f"{stream_log_prefix} Received 'done:true' message. Cancel pending: {cancel_pending}, Status before: {status_before_done}")
+        #
+        #                     if cancel_pending:
+        #                         print(
+        #                             f"{stream_log_prefix} 'done:true' but cancel is pending. Deferring final status to worker/None signal.")
+        #                     elif status_before_done not in ["CANCELLED", "ERROR", "FINISHED"]:
+        #                         if is_error:
+        #                             self.cache.set(conversation_id, "status", "ERROR")
+        #                             if not self.cache.get(conversation_id, "error_message"):
+        #                                 self.cache.set(conversation_id, "error_message",
+        #                                                response_data.get("message", "Error from stream"))
+        #                             print(f"{stream_log_prefix} Set status to ERROR via done:true,error:true message.")
+        #                         else:
+        #                             self.cache.set(conversation_id, "status", "FINISHED")
+        #                             if response_data.get('sql'): self.cache.set(conversation_id, "sql",
+        #                                                                         response_data.get('sql'))
+        #                             print(f"{stream_log_prefix} Set status to FINISHED via done:true message.")
+        #             except json.JSONDecodeError:
+        #                 print(f"{stream_log_prefix} Warning: Could not parse JSON from stream: {response}")
+        #             except Exception as e:
+        #                 print(f"{stream_log_prefix} Error processing streamed message: {e}")
+        #                 if self.cache.get(conversation_id, "status") not in ["CANCELLED", "ERROR", "FINISHED"]:
+        #                     self.cache.set(conversation_id, "status", "ERROR")
+        #                     self.cache.set(conversation_id, "error_message", f"Error processing stream: {e}")
+        #
+        #         final_cached_status = self.cache.get(conversation_id, "status")
+        #
+        #     return Response(generate(), mimetype='text/event-stream')
+
         @self.flask_app.route("/api/v0/api/ask_task/status", methods=["GET"])
         def task_status_endpoint():
-            query_id = request.args.get('queryId')
+            query_id = request.args.get('query_id')
             if not query_id:
                 return jsonify({"error": "Missing queryId parameter"}), 400
-                
+
             # Retrieve task info from cache
-            status = self.cache.get(query_id, "status") or "UNDERSTANDING"
+            status = self.cache.get(query_id, CacheTypes.STATUS)
             task_type = self.cache.get(query_id, "type") or "TEXT_TO_SQL"
-            question = self.cache.get(query_id, "question") or ""
-            
-            # Build response with available data
-            response = {
-                "askingTask": {
-                    "queryId": query_id,
-                    "status": status,
-                    "type": task_type,
-                    "question": question,
-                    "retrievedTables": [],
-                    "sqlGenerationReasoning": ""
-                }
+            question = self.cache.get(query_id, CacheTypes.QUESTION) or ""
+
+            if status is None:
+                if self.cache.get(query_id, "output_queue"):
+                    status = "PENDING"
+                else:
+                    return jsonify({"error": "Task with specified queryId not found or not initialized.",
+                                    "queryId": query_id}), 404
+
+            response_task_data = {
+                "queryId": query_id, "status": status, "type": task_type, "question": question,
+                "retrievedTables": self.cache.get(query_id, "retrievedTables") or [],
+                "sqlGenerationReasoning": self.cache.get(query_id, "sqlGenerationReasoning") or ""
             }
-            
-            return jsonify(response)
+
+            if status == "FINISHED":
+                response_task_data["sql"] = self.cache.get(query_id, CacheTypes.SQL)
+            elif status == "ERROR":
+                response_task_data["error_message"] = self.cache.get(query_id, "error_message") or "Unspecified error."
+            elif status == "CANCELLED":
+                response_task_data["message"] = "Task was cancelled by the user."
+
+            return jsonify({"askingTask": response_task_data})
+
+        @self.flask_app.route("/api/v0/api/ask_task/cancel", methods=["POST"])
+        def cancel_task_endpoint() -> any:
+            data = request.get_json()
+            query_id = data.get("query_id")
+            if not query_id:
+                return jsonify({"error": "Missing 'queryId' in request body."}), 400
+
+            cancel_log_prefix = f"CancelEP {query_id}:"
+            print(f"{cancel_log_prefix} Request received.")
+
+            current_status = self.cache.get(query_id, CacheTypes.STATUS)
+            output_queue_exists = bool(self.cache.get(query_id, "output_queue"))
+            print(f"{cancel_log_prefix} Current status: {current_status}, Output queue exists: {output_queue_exists}")
+
+            if not output_queue_exists and current_status not in ["STREAMING", "CANCELLING",
+                                                                  "PENDING"]:  # Check if it ever really started
+                print(f"{cancel_log_prefix} Task not found or never fully initialized for cancellation.")
+                return jsonify({"message": "Task not found or never fully initialized.", "queryId": query_id}), 404
+
+            if current_status in ["FINISHED", "ERROR", "CANCELLED"]:
+                print(f"{cancel_log_prefix} Task already in terminal state: {current_status}.")
+                return jsonify({"message": f"Task {query_id} is already {current_status}."}), 200
+            if current_status == "CANCELLING":
+                print(f"{cancel_log_prefix} Task already being cancelled.")
+                return jsonify({"message": f"Task {query_id} is already being cancelled."}), 200
+
+            self.cache.set(query_id, "cancel_requested", True)
+            self.cache.set(query_id, "status", "CANCELLING")
+            print(f"{cancel_log_prefix} Set cancel_requested=True, status=CANCELLING.")
+
+            return jsonify({"message": "Cancellation request processed. Task is being stopped.", "queryId": query_id,
+                            "status": "CANCELLING"}), 200
 
         @self.flask_app.route("/api/v0/train", methods=["POST"])
-        @self.requires_auth
-        def add_training_data(user: any):
+        def add_training_data():
             """
             Add training data
             ---
@@ -1130,15 +1477,28 @@ class FlaskAPI:
                     id:
                       type: string
             """
+
+            if not request.json:
+                print("Request body must be JSON for /create_conversation_contextual", "Error")
+                return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
+
             question = flask.request.json.get("question")
             sql = flask.request.json.get("sql")
-            ddl = flask.request.json.get("ddl")
-            documentation = flask.request.json.get("documentation")
+            # ddl = flask.request.json.get("ddl")
+            # documentation = flask.request.json.get("documentation")
+            # conversation_id = request.json.get("conversation_id")
+            # user_id = request.cookies.get("session_id", "empty")
+
+            if not question:
+                print("Missing question in request for /add_training_data", "Error")
+                return jsonify({"type": "error", "error": "conversation_id is required"}), 400
+
+            if not sql:
+                print("Missing sql in request for /add_training_data", "Error")
+                return jsonify({"type": "error", "error": "sql is required"}), 400
 
             try:
-                id = copilot.train(
-                    question=question, sql=sql, ddl=ddl, documentation=documentation
-                )
+                id = self.copilot.train(question=question, sql=sql)
 
                 return jsonify({"id": id})
             except Exception as e:
@@ -1172,7 +1532,7 @@ class FlaskAPI:
                     function_template:
                       type: object
             """
-            plotly_code = self.cache.get(id=id, field="plotly_code")
+            plotly_code = self.cache.get(id=id, field=CacheTypes.PLOTLY_CODE)
 
             if plotly_code is None:
                 plotly_code = ""
@@ -1320,7 +1680,7 @@ class FlaskAPI:
                 required: true
             """
             if self.allow_llm_to_see_data:
-                sql = self.cache.get(id=id, field="sql")
+                sql = self.cache.get(id=id, field=CacheTypes.SQL)
                 summary = copilot.generate_summary(question=question, sql=sql, df=df)
                 self.cache.set(id=id, field="summary", value=summary)
 
@@ -1381,18 +1741,10 @@ class FlaskAPI:
 
             print("got this id:", conv_id)
             try:
-                # return jsonify(
-                #     {
-                #         "type": "question_cache",
-                #         "id": id,
-                #         "question": question,
-                #         "sql": sql,
-                #         "df": df.head(10).to_json(orient="records", date_format="iso"),
-                #         "fig": fig_json,
-                #         "summary": summary,
-                #     }
-                # )
-                return copilot.get_conversation_by_id(user_id=user_id, conversation_id=conv_id)
+
+                conversation = self.copilot.get_conversation_by_id(user_id=user_id, conversation_id=conv_id)
+                print("conversation:", conversation)
+                return conversation
 
             except Exception as e:
                 traceback.print_exc()
@@ -1422,12 +1774,15 @@ class FlaskAPI:
             """
 
             user_id = flask.request.cookies.get("session_id")
-            all_questions = cache.get_all(field_list=["question"])
+
+            history_list = self.copilot.get_conversation_history(user_id)
+            for obj in history_list:
+                print(obj['id'], obj["name"])
 
             return jsonify(
                 {
                     "type": "question_history",
-                    "questions": copilot.get_conversation_history(user_id),
+                    "questions": history_list,
                 }
             )
 
@@ -1449,16 +1804,31 @@ class FlaskAPI:
                     self.ws_clients.remove(ws)
 
     def run(self, *args, **kwargs):
-        """
-        Run the Flask app.
+        # Ensure DB table exists and enable WAL before starting
+        CONVERSATION_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\conversations.db"
 
-        Args:
-            *args: Arguments to pass to Flask's run method.
-            **kwargs: Keyword arguments to pass to Flask's run method.
+        with sqlite3.connect(CONVERSATION_DB_PATH) as init_conn:
+            init_conn.execute("PRAGMA journal_mode=WAL;")
+            init_conn.execute("PRAGMA synchronous=NORMAL;")
+            init_conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS message_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    content TEXT,
+                    tool_calls TEXT,
+                    extracted_sql TEXT,
+                    reasoning TEXT
+                );
+                '''
+            )
+            init_conn.commit()
 
-        Returns:
-            None
-        """
+        # Run the Flask server
         if args or kwargs:
             self.flask_app.run(*args, **kwargs)
         else:
@@ -1518,6 +1888,7 @@ class FlaskApp(FlaskAPI):
             ask_results_correct: Whether to ask the user if the results are correct. Defaults to True.
             followup_questions: Whether to show followup questions. Defaults to True.
             summarization: Whether to show summarization. Defaults to True.
+            function_generation: Whether to show function generation. Defaults to True.
             index_html_path: Path to the index.html. Defaults to None, which will use the default index.html
             assets_folder: The location where you'd like to serve the static assets from. Defaults to None, which will use hardcoded Python variables.
 
