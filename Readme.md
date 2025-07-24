@@ -4,6 +4,16 @@
 
 GMD-Copilot is a project that aims to provide an AI-powered copilot for various tasks, leveraging large language models (LLMs) and vector databases. It integrates with Flask for the web application and uses ChromaDB for vector storage. The project appears to be designed to assist with documentation, data definition language (DDL), and SQL-related queries.
 
+## Demo
+
+You can view a video demonstration of the application below.
+
+[Watch the Demo](./demo/demo.mp4)
+
+Alternatively, here is an embedded version:
+<video src="https://github.com/AymanAitAhmed/GMD-Copilot/raw/main/demo/demo.mp4" controls="controls" style="max-width: 720px;">
+</video>
+
 ## Features
 
 - **AI-Powered Assistance**: Utilizes OpenAI models (or compatible alternatives like OpenRouter) for natural language understanding and generation.
@@ -59,8 +69,6 @@ Once the application is running, you can interact with the GMD-Copilot through i
 - **Documentation Generation**: Automatically generate documentation based on provided context.
 - **DDL Generation**: Create Data Definition Language (DDL) statements for database schemas.
 - **SQL Query Assistance**: Help in generating and understanding SQL queries.
-
-## Demo
 
 
 
