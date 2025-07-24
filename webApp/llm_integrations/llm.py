@@ -20,9 +20,9 @@ class OpenAI_Chat(CopilotBase):
         CopilotBase.__init__(self, config=config)
 
         # default parameters - can be overrided using config
-        self.temperature = 0.3
+        self.temperature = 0.1
 
-        api_key = "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"
+        api_key = os.getenv("GROQ_API_KEY")
         self.groq_client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1/")
 
         if "temperature" in config:

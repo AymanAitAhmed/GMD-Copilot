@@ -27,6 +27,7 @@ from .exceptions import ImproperlyConfigured, ValidationError
 from .training_plan import TrainingPlan, TrainingPlanItem
 
 CONVERSATION_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\conversations.db"
+CHART_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\charts.db"
 thread_local = threading.local()
 
 
@@ -58,6 +59,34 @@ def get_connection():
         return conn
 
 
+def get_chart_db_connection():
+    """
+    If we are in a Flask request context, reuse g.chart_db_conn (or open it).
+    Otherwise fall back to a thread‑local connection.
+    """
+    if has_app_context():
+        # Flask request → store in g
+        if not hasattr(g, 'chart_db_conn'):
+            conn = sqlite3.connect(CHART_DB_PATH,
+                                   timeout=30.0,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            g.chart_db_conn = conn
+        return g.chart_db_conn
+    else:
+        # outside Flask → thread‑local
+        conn = getattr(thread_local, 'chart_conn', None)
+        if conn is None:
+            conn = sqlite3.connect(CHART_DB_PATH,
+                                   timeout=30.0,
+                                   check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.commit()
+            thread_local.chart_conn = conn
+        return conn
+
+
 class CopilotBase(ABC):
     def __init__(self, config=None):
         if config is None:
@@ -69,6 +98,7 @@ class CopilotBase(ABC):
         self.dialect = self.config.get("dialect", "SQL")
         self.language = self.config.get("language", None)
         self.max_tokens = self.config.get("max_tokens", 14000)
+        self.create_charts_table()
 
     def log(self, message: str, title: str = "Info"):
         print(f"{title}: {message}")
@@ -136,6 +166,47 @@ class CopilotBase(ABC):
                  reasoning)
             )
             conn.commit()
+        finally:
+            cursor.close()
+
+    def create_charts_table(self):
+        conn = get_chart_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS charts (
+                    id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    chart_json TEXT NOT NULL
+                )"""
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+
+    def add_chart(self, chart_json: str):
+        conn = get_chart_db_connection()
+        cursor = conn.cursor()
+        chart_id = str(uuid.uuid4())
+        timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
+        try:
+            cursor.execute(
+                """INSERT INTO charts (id, timestamp, chart_json)
+                   VALUES (?, ?, ?)""",
+                (chart_id, timestamp, chart_json)
+            )
+            conn.commit()
+            return chart_id
+        finally:
+            cursor.close()
+
+    def get_all_charts(self):
+        conn = get_chart_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, timestamp, chart_json FROM charts ORDER BY timestamp DESC")
+            charts = cursor.fetchall()
+            return [{"id": row[0], "timestamp": row[1], "chart_json": json.loads(row[2])} for row in charts]
         finally:
             cursor.close()
             # We don't close the connection here as it's managed by Flask's app context
@@ -265,8 +336,6 @@ class CopilotBase(ABC):
                 "threadId": conversation_id,
                 "question": user_question,
                 "sql": assistant_sql,
-                "view": None,
-                "breakdownDetail": None,
                 "answerDetail": {
                     "queryId": query_id,
                     "status": status,
@@ -278,8 +347,6 @@ class CopilotBase(ABC):
                 },
                 "chartDetail": None,
                 "askingTask": None,
-                "adjustment": None,
-                "adjustmentTask": None,
                 "__typename": "ThreadResponse"
             }
 
@@ -291,6 +358,24 @@ class CopilotBase(ABC):
             return {"data": {"thread": thread_data}}
         finally:
             cursor.close()
+
+
+    def delete_conversation(self, user_id, conversation_id):
+        conn = get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM message_history WHERE conversation_id = ?",
+                (str(conversation_id),)
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            print(f"Couldn't delete the conversation that has the id '{conversation_id}'. error: {e}")
+            return False
+        finally:
+            cursor.close()
+
 
     def get_table_schemas(self, ):
         """
@@ -381,6 +466,7 @@ class CopilotBase(ABC):
             str: The SQL query that answers the question.
         """
         messages = self.create_or_load_conversation(conversation_id=conversation_id, user_id=user_id)
+        print(messages)
         llm_response = self.submit_prompt(messages, **kwargs)
         self.log(title="LLM Response", message=llm_response)
 
@@ -905,12 +991,17 @@ class CopilotBase(ABC):
             initial_prompt = self.add_documentation_to_prompt(
                 initial_prompt, doc_list, max_tokens=self.max_tokens
             )
+        db_tables = self.con.sql("SELECT table_name,column_name, data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE table_schema='public'").df().to_markdown()
+        initial_prompt += (
+            "===The following tables are in the DuckDB database:\n"
+            f"{db_tables}"
+        )
 
         if not len(mytables) == 0:
             for i, table in enumerate(mytables):
                 table_name = f'{table=}'.split('=')[0]
                 table_name += f"{i}"
-                initial_prompt += "The following columns are in the table named '" + table_name + "' \n"
+                initial_prompt += "The following columns are in the table uploaded by the user and its used in duckdb with the name: '" + table_name + "' \n"
 
                 buf = io.StringIO()
                 table.info(buf=buf)
@@ -1154,21 +1245,21 @@ class CopilotBase(ABC):
         if df.shape == (1, 1):
             code = """import plotly.graph_objects as go
 
-column_name = df.columns[0]  # Get the column name
-unique_values = df[column_name].dropna().unique()  # Get unique non-null values
+        column_name = df.columns[0]  # Get the column name
+        unique_values = df[column_name].dropna().unique()  # Get unique non-null values
 
-if len(unique_values) == 1:
-    value = unique_values[0]  # Extract the unique value
+        if len(unique_values) == 1:
+            value = unique_values[0]  # Extract the unique value
 
-    # Create the indicator plot
-    fig = go.Figure(go.Indicator(
-        mode="number",
-        value=value,
-        number={'font': {'size': 80}},  # Adjust font size
-        title={'text': column_name, 'font': {'size': 30}},  # Set column name as title
-    ))
+            # Create the indicator plot
+            fig = go.Figure(go.Indicator(
+                mode="number",
+                value=value,
+                number={'font': {'size': 80}},  # Adjust font size
+                title={'text': column_name, 'font': {'size': 30}},  # Set column name as title
+            ))
 
-    fig.show()"""
+            fig.show()"""
 
         final_code = self._sanitize_plotly_code(self._extract_python_code(code))
         return final_code

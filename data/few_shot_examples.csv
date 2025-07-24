@@ -1,4 +1,419 @@
 question,content
+Does the volume of 997808 of the Article1 M000463G01 exceed the capacity of the shift 3 multiply by 2?,"WITH params AS (
+    SELECT 
+        ""Cadence"",
+        ""Emp.Moule"",
+        ""Emp.Pce"",
+        ""TRS""
+    FROM charge_capa3
+    WHERE ""Article1"" = 'M000463G01'
+    LIMIT 1
+),
+tps_calculations AS (
+    SELECT 
+        997808 AS target_volume,
+        target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0))) AS tps_machine_net,
+        (target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0)))) 
+        * ((1 - p.""TRS"") / NULLIF(p.""TRS"", 0)) AS tps_pertes
+    FROM params p
+),
+total_tps AS (
+    SELECT 
+        tps_machine_net + tps_pertes AS total_required_tps
+    FROM tps_calculations
+),
+shift3_capacity AS (
+    SELECT SUM(capacity / 4) * 2 AS doubled_annual_capacity
+    FROM capacity
+    WHERE shift_number = 3
+)
+SELECT 
+    total_required_tps,
+    doubled_annual_capacity,
+    CASE 
+        WHEN total_required_tps > doubled_annual_capacity THEN 'Yes' 
+        ELSE 'No' 
+    END AS capacity_exceeded
+FROM total_tps, shift3_capacity;"
+can you give me if the article M000463G01 and M000671G01 has 997808 in there volume exceed the shift capacity of the shift 3,"WITH annual_capacity AS (
+    SELECT SUM(capacity / 4) AS total_annual_capacity
+    FROM capacity
+    WHERE shift_number = 3
+),
+articles AS (
+    SELECT 'M000463G01' AS article
+    UNION ALL
+    SELECT 'M000671G01'
+),
+params AS (
+    SELECT 
+        a.article,
+        c.""Cadence"",
+        c.""Emp.Moule"",
+        c.""Emp.Pce"",
+        c.""TRS""
+    FROM articles a
+    LEFT JOIN (
+        SELECT 
+            ""Article1"",
+            ""Cadence"",
+            ""Emp.Moule"",
+            ""Emp.Pce"",
+            ""TRS"",
+            ROW_NUMBER() OVER (PARTITION BY ""Article1"" ORDER BY ""Article1"") as rn
+        FROM charge_capa3
+        WHERE ""Article1"" IN ('M000463G01', 'M000671G01')
+    ) c ON a.article = c.""Article1"" AND c.rn = 1
+),
+tps_calculations AS (
+    SELECT 
+        article,
+        997808 AS target_volume,
+        target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0))) AS tps_machine_net,
+        (target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0)))) 
+        * ((1 - p.""TRS"") / NULLIF(p.""TRS"", 0)) AS tps_pertes
+    FROM params p
+),
+total_tps AS (
+    SELECT 
+        article,
+        tps_machine_net + tps_pertes AS total_required_tps
+    FROM tps_calculations
+)
+SELECT 
+    t.article,
+    t.total_required_tps,
+    ac.total_annual_capacity,
+    CASE 
+        WHEN t.total_required_tps <= ac.total_annual_capacity THEN 'No' 
+        ELSE 'Yes' 
+    END AS capacity_exceeded
+FROM total_tps t
+CROSS JOIN annual_capacity ac;"
+"can you show me the Composant M000634D01 and M000634G01 with there Art.intra-process, Opé,  Description, Pos.trav","SELECT 
+    ""Composant"",
+    ""Art.intra-process"",
+    ""Opé."",
+    ""Description"",
+    ""Pos.trav""
+FROM charge_capa3
+WHERE ""Art.intra-process"" IN ('M000634D01', 'M000634G01');"
+can you show me all machine that exceted the capacity of the shift 3,"WITH shift3_total AS (
+   SELECT
+     SUM(capacity::numeric / 4) AS base_capacity
+   FROM capacity
+   WHERE shift_number = 3
+),
+machines_data AS (
+   SELECT
+     ""Pos.trav""              AS machine,
+     max(""Nbre de PDC"")       AS total_pdc,
+     SUM(""TPS MACHINE TT"")    AS total_machine_time
+   FROM charge_capa3
+   WHERE ""TPS MACHINE NET"" IS NOT NULL
+     AND ""Is_Masque"" = FALSE
+   GROUP BY ""Pos.trav""
+),
+adjusted_capacity AS (
+   SELECT
+     m.machine,
+     s.base_capacity * GREATEST(m.total_pdc, 1) AS annual_capacity,
+     m.total_machine_time
+   FROM machines_data AS m
+   CROSS JOIN shift3_total AS s
+)
+SELECT
+  a.machine,
+  a.annual_capacity,
+  a.total_machine_time,
+  CASE
+    WHEN a.total_machine_time > a.annual_capacity THEN 'Exceeded'
+    ELSE 'Sufficient'
+  END AS capacity_status
+FROM adjusted_capacity AS a
+WHERE a.total_machine_time > a.annual_capacity;"
+can you give if the capacity anuual of the ZAP 'ZAP Goujon' pass the capacity of the shift 3,"WITH nbrpost AS (
+    SELECT DISTINCT 
+        ""Pos.trav"",
+        ""Nbre de PDC""
+    FROM charge_capa3
+    WHERE
+        ""TPS MACHINE NET"" IS NOT NULL
+        AND ""Is_Masque"" = FALSE
+        AND ""ZAP"" = 'ZAP Goujon'
+),
+total_pdc AS (
+    SELECT SUM(""Nbre de PDC"") AS sum_pdc
+    FROM nbrpost
+),
+base_capacity AS (
+    SELECT SUM(c.capacity / 4) AS base_capacity
+    FROM capacity c
+    WHERE c.shift_number = 3
+),
+annual_shift_capacity AS (
+    SELECT 
+        bc.base_capacity * tp.sum_pdc AS total_annual_capacity
+    FROM base_capacity bc
+    CROSS JOIN total_pdc tp
+),
+machine_requirements AS (
+    SELECT 
+        SUM(""TPS MACHINE TT"" + ""TPS PERTES"") AS total_machine_time
+    FROM charge_capa3
+    WHERE 
+        ""ZAP"" = 'ZAP Goujon'
+        AND ""TPS MACHINE NET"" IS NOT NULL
+        AND ""Is_Masque"" = FALSE
+)
+SELECT 
+    total_annual_capacity,
+    COALESCE(total_machine_time, 0) AS total_machine_time,
+    CASE 
+        WHEN total_annual_capacity >= COALESCE(total_machine_time, 0) 
+        THEN 'Capacity sufficient' 
+        ELSE 'Capacity exceeded' 
+    END AS capacity_status
+FROM annual_shift_capacity, machine_requirements;"
+can you show me idf we exceted the capacity of the ZAP GT compare to shift 3,"WITH nbrpost AS (
+    -- Grab each machine’s PDC count
+    SELECT DISTINCT 
+        ""Pos.trav"",
+        ""Nbre de PDC""
+    FROM charge_capa3
+    WHERE
+        ""TPS MACHINE NET"" IS NOT NULL
+        AND ""Is_Masque"" = FALSE
+        AND ""ZAP"" = 'ZAP GT'
+),
+total_pdc AS (
+    -- Sum up all the PDCs once
+    SELECT SUM(""Nbre de PDC"") AS sum_pdc
+    FROM nbrpost
+),
+base_capacity AS (
+    -- Just sum up the base capacity (divide by 4 as needed)
+    SELECT SUM(c.capacity / 4) AS base_capacity
+    FROM capacity c
+    WHERE c.shift_number = 3
+),
+annual_shift_capacity AS (
+    -- Multiply summed capacity by sum_pdc
+    SELECT 
+        bc.base_capacity * tp.sum_pdc AS total_annual_capacity
+    FROM base_capacity bc
+    CROSS JOIN total_pdc tp
+),
+machine_requirements AS (
+    -- Sum total required machine time
+    SELECT 
+	SUM(""TPS MACHINE NET"") as TMN,
+	SUM(""TPS PERTES"") as TP,
+    SUM(""TPS MACHINE NET"") + SUM(""TPS PERTES"") AS total_machine_time
+    FROM charge_capa3
+    WHERE 
+	""TPS MACHINE NET"" IS NOT NULL
+    AND ""Is_Masque"" = FALSE
+	AND ""ZAP"" = 'ZAP GT'
+)
+-- Final select with non-reserved aliases
+SELECT 
+    ann_cap.total_annual_capacity,
+    COALESCE(mr.total_machine_time, 0) AS total_machine_time,
+    CASE 
+        WHEN ann_cap.total_annual_capacity >= COALESCE(mr.total_machine_time, 0) 
+        THEN 'Capacity sufficient' 
+        ELSE 'Capacity exceeded' 
+    END AS capacity_status
+FROM annual_shift_capacity AS ann_cap
+CROSS JOIN machine_requirements AS mr;
+"
+can you show if the ZAP CELLULE SR exceeted the capacity of the shift 3,"WITH nbrpost AS (
+    -- Grab each machine’s PDC count
+    SELECT DISTINCT 
+        ""Pos.trav"",
+        ""Nbre de PDC""
+    FROM charge_capa3
+    WHERE
+        C IS NOT NULL
+        AND ""Is_Masque"" = FALSE
+        AND ""ZAP"" = 'ZAP CELLULE SR'
+),
+total_pdc AS (
+    -- Sum up all the PDCs once
+    SELECT SUM(""Nbre de PDC"") AS sum_pdc
+    FROM nbrpost
+),
+base_capacity AS (
+    -- Just sum up the base capacity (divide by 4 as needed)
+    SELECT SUM(c.capacity / 4) AS base_capacity
+    FROM capacity c
+    WHERE c.shift_number = 3
+),
+annual_shift_capacity AS (
+    -- Multiply summed capacity by sum_pdc
+    SELECT 
+        bc.base_capacity * tp.sum_pdc AS total_annual_capacity
+    FROM base_capacity bc
+    CROSS JOIN total_pdc tp
+),
+machine_requirements AS (
+    -- Sum total required machine time
+    SELECT 
+	SUM(""TPS MACHINE NET"") as TMN,
+	SUM(""TPS PERTES"") as TP,
+    SUM(""TPS MACHINE NET"") + SUM(""TPS PERTES"") AS total_machine_time
+    FROM charge_capa3
+    WHERE 
+	""TPS MACHINE NET"" IS NOT NULL
+    AND ""Is_Masque"" = FALSE
+	AND ""ZAP"" = 'ZAP CELLULE SR'
+)
+-- Final select with non-reserved aliases
+SELECT 
+	mr.TMN as TMN,
+	mr.TP as TP,
+    ann_cap.total_annual_capacity,
+    COALESCE(mr.total_machine_time, 0) AS total_machine_time,
+    CASE 
+        WHEN ann_cap.total_annual_capacity >= COALESCE(mr.total_machine_time, 0) 
+        THEN 'Capacity sufficient' 
+        ELSE 'Capacity exceeded' 
+    END AS capacity_status
+FROM annual_shift_capacity AS ann_cap
+CROSS JOIN machine_requirements AS mr;
+"
+is the capacity of the machine PRP_AC exceted the shift 3 compart it annualy,"WITH nbrpost AS (
+    -- Grab each machine’s PDC count
+    SELECT DISTINCT 
+        ""Pos.trav"",
+        ""Nbre de PDC""
+    FROM charge_capa3
+    WHERE
+        ""TPS MACHINE NET"" IS NOT NULL
+        AND ""Is_Masque"" = FALSE
+        AND ""Pos.trav"" = 'PRP_AC'
+),
+total_pdc AS (
+    -- Sum up all the PDCs once
+    SELECT SUM(""Nbre de PDC"") AS sum_pdc
+    FROM nbrpost
+),
+base_capacity AS (
+    -- Just sum up the base capacity (divide by 4 as needed)
+    SELECT SUM(c.capacity / 4) AS base_capacity
+    FROM capacity c
+    WHERE c.shift_number = 3
+),
+annual_shift_capacity AS (
+    -- Multiply summed capacity by sum_pdc
+    SELECT 
+        bc.base_capacity * tp.sum_pdc AS total_annual_capacity
+    FROM base_capacity bc
+    CROSS JOIN total_pdc tp
+),
+machine_requirements AS (
+    -- Sum total required machine time
+    SELECT 
+        SUM(""TPS MACHINE TT"") AS total_machine_time
+    FROM charge_capa3
+    WHERE 
+	""TPS MACHINE NET"" IS NOT NULL
+    AND ""Is_Masque"" = FALSE
+	AND ""Pos.trav"" = 'PRP_AC'
+)
+-- Final select with non-reserved aliases
+SELECT 
+    ann_cap.total_annual_capacity,
+    COALESCE(mr.total_machine_time, 0) AS total_machine_time,
+    CASE 
+        WHEN ann_cap.total_annual_capacity >= COALESCE(mr.total_machine_time, 0) 
+        THEN 'Capacity sufficient' 
+        ELSE 'Capacity exceeded' 
+    END AS capacity_status
+FROM annual_shift_capacity AS ann_cap
+CROSS JOIN machine_requirements AS mr;
+"
+is the capacity of the machine ILT_SR01 exceted the shift 3 compart it annualy,"WITH annual_shift_capacity AS (
+    SELECT 
+        SUM(capacity / 4) AS total_annual_capacity
+    FROM shift_capacity
+    WHERE shift_number = 3
+),
+machine_requirements AS (
+    SELECT 
+        SUM(""TPS MACHINE TT"") AS total_machine_time
+    FROM charge_capa3
+    WHERE ""Pos.trav"" = 'ILT_SR01'
+)
+SELECT 
+    total_annual_capacity,
+    COALESCE(total_machine_time, 0) AS total_machine_time,
+    CASE 
+        WHEN total_annual_capacity >= COALESCE(total_machine_time, 0) 
+        THEN 'Capacity sufficient' 
+        ELSE 'Capacity exceeded' 
+    END AS capacity_status
+FROM annual_shift_capacity, machine_requirements;"
+can you show me for the zap SR what how exceted the capactity of the 3 shifts try to calaculated annualy,"WITH shift_capacity_sr AS (
+    SELECT 
+        SUM(capacity / 4) AS total_annual_capacity_sr
+    FROM capacity 
+	where
+		shift_number IN (3)
+),
+machine_pa0300_requirements AS (
+    SELECT 
+        SUM(""TPS MACHINE TT"") AS total_machine_time_pa0300
+    FROM charge_capa3
+    WHERE ""Pos.trav"" = 'PA0300'
+)
+SELECT 
+    total_annual_capacity_sr,
+    total_machine_time_pa0300,
+    CASE 
+        WHEN total_annual_capacity_sr >= total_machine_time_pa0300 
+        THEN 'Sufficient' 
+        ELSE 'Insufficient' 
+    END AS capacity_status
+FROM shift_capacity_sr, machine_pa0300_requirements;"
+can you show me all development program,"SELECT DISTINCT ""Numéro d'article"" AS development_program
+FROM manufacturing_data;"
+"are we able to produce 974647 parts in a year for article M000463G01, use the following formulas: TPS MACHINE NET = Volume / (Cadence*(emp moul/emp piece)) TPS PERTES = TPS MACHINE NET*((1-TRS)/(TRS)) then sum the two of them, and compare it with the annual capacity(sum of (capacity divided by 4)) of shift_number 3","WITH parameters AS (
+    SELECT 
+        ""Cadence"",
+        ""Emp.Moule"",
+        ""Emp.Pce"",
+        ""TRS""
+    FROM charge_capa3
+    WHERE ""Article1"" = 'M000463G01'
+),
+tps_calculations AS (
+    SELECT 
+        974647 AS target_volume,
+        target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0))) AS tps_machine_net,
+        (target_volume / (p.""Cadence"" * (p.""Emp.Moule"" / NULLIF(p.""Emp.Pce"", 0)))) 
+        * ((1 - p.""TRS"") / NULLIF(p.""TRS"", 0)) AS tps_pertes
+    FROM parameters p
+),
+total_tps AS (
+    SELECT 
+        tps_machine_net + tps_pertes AS total_required_tps
+    FROM tps_calculations
+),
+annual_capacity AS (
+    SELECT SUM(capacity / 4) AS total_annual_capacity
+    FROM capacity
+    WHERE shift_number = 3
+)
+SELECT 
+    total_required_tps,
+    total_annual_capacity,
+    CASE 
+        WHEN total_required_tps <= total_annual_capacity THEN 'Yes' 
+        ELSE 'No' 
+    END AS production_possible
+FROM total_tps, annual_capacity;"
 "How many machines are needed to produce 50,000 pieces per year if the production rate is based on the average weekly production ?","WITH weekly_production AS (
     SELECT 
         COUNT(*) AS units_produced

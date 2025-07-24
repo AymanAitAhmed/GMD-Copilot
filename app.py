@@ -1,5 +1,6 @@
 from typing import List
 import os
+from dotenv import load_dotenv
 
 from openai import OpenAI
 
@@ -8,8 +9,9 @@ from webApp.my_chromadb.chromadb import ChromaDB_VectorStore
 from FlaskApp import FlaskApp
 from constants import *
 
+load_dotenv()
 
-open_router = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+open_router = OpenAI(api_key=os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
 
 
 class BaseApp(ChromaDB_VectorStore, OpenAI_Chat):
@@ -24,11 +26,11 @@ class BaseApp(ChromaDB_VectorStore, OpenAI_Chat):
 
 
 base_app = BaseApp(config={
-    'model': 'deepseek/deepseek-r1-0528:free',
+    'model': 'microsoft/mai-ds-r1:free',
     "path": chromadb_path,
     "client": "persistent",
-    "temperature": 0,
-    "language": "French",
+    "temperature": 0.1,
+    "language": "English-",
     "n_results_sql": 3
 })
 
@@ -70,10 +72,10 @@ def init_vector_db(base_app, include_examples=True):
 
 create_first_vector_db = len(os.listdir(chromadb_path)) <= 1
 
-# if create_first_vector_db:
-#     init_vector_db(base_app=base_app)
-# else:
-#     init_vector_db(base_app=base_app, include_examples=False)
+if create_first_vector_db:
+    init_vector_db(base_app=base_app)
+else:
+    init_vector_db(base_app=base_app, include_examples=False)
 
 app = FlaskApp(base_app, allow_llm_to_see_data=True, debug=True,
                logo=logo_path,

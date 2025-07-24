@@ -19,6 +19,7 @@ sqlparse
 flask
 flasgger
 werkzeug
+python-dotenv
 flask-sock
 
 # ChromaDB vector store integration

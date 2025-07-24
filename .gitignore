@@ -1,0 +1,9 @@
+# Environment variables
+.env
+data/
+# Python cache
+__pycache__/
+*.pyc
+
+
+constants.py

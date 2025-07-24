@@ -196,9 +196,15 @@ class FlaskAPI:
             if conn:
                 conn.close()
 
+            chart_conn = g.pop('chart_db_conn', None)
+            if chart_conn:
+                chart_conn.close()
+
         self.swagger = Swagger(
             self.flask_app, template={"info": {"title": "Copilot API"}}
         )
+
+
         self.sock = Sock(self.flask_app)
         self.ws_clients = []
         self.copilot = copilot
@@ -746,16 +752,16 @@ class FlaskAPI:
         @self.flask_app.route("/api/v0/run_sql", methods=["POST"])
         def run_sql():
 
-            attempt = 0
-            last_error = None
-
             if not request.json:
                 print("Request body must be JSON for /create_conversation_contextual", "Error")
                 return jsonify({"type": "error", "error": "Request body must be JSON"}), 400
 
             conversation_id = request.json.get("conversation_id")
             sql = request.json.get("sql")
+            allow_correction = request.json.get("allow_correction",True)
             user_id = request.cookies.get("session_id", "empty")
+            attempt = 0
+            last_error = None
 
             if not conversation_id:
                 print("Missing conversation_id in request for /create_conversation_contextual", "Error")
@@ -788,6 +794,7 @@ class FlaskAPI:
                     return jsonify({
                         "type": "df",
                         "id": conversation_id,
+                        "fixing_attempts": attempt,
                         "df": df_returned.head(100).to_json(orient='records', date_format='iso'),
                         "should_generate_chart": self.chart and copilot.should_generate_chart(df_returned),
                     })
@@ -1016,15 +1023,15 @@ class FlaskAPI:
                 return jsonify({'type': 'error', 'error': "please provide the question asked by the user."}), 400
 
             fig_json = self.cache.get(id=conversation_id, field=CacheTypes.FIG_JSON)
-            if fig_json:
-                return jsonify(
-                    {
-                        "type": "plotly_figure",
-                        "fig": fig_json,
-                    }
-                )
+            chart_instructions = request.json.get('chart_instructions')
+            # if fig_json and not chart_instructions:
+            #     return jsonify(
+            #         {
+            #             "type": "plotly_figure",
+            #             "fig": fig_json,
+            #         }
+            #     )
 
-            chart_instructions = flask.request.args.get('chart_instructions')
             print("chart instructions:", chart_instructions)
             df = self.cache.get(conversation_id, CacheTypes.DF)
             try:
@@ -1776,15 +1783,91 @@ class FlaskAPI:
             user_id = flask.request.cookies.get("session_id")
 
             history_list = self.copilot.get_conversation_history(user_id)
-            for obj in history_list:
-                print(obj['id'], obj["name"])
-
             return jsonify(
                 {
                     "type": "question_history",
                     "questions": history_list,
                 }
             )
+
+        @self.flask_app.route("/api/v0/delete_conversation", methods=["DELETE"])
+        @self.requires_auth
+        def delete_conversation(user: any):
+
+            user_id = flask.request.cookies.get("session_id")
+            conv_id = flask.request.args.get("id", None)
+            if not conv_id:
+                return jsonify({"type": "error", "error": "`id` query-parameter is required"}), 400
+
+            result = self.copilot.delete_conversation(user_id,conv_id)
+            if result:
+                return jsonify({"type": "message", "content": "Conversation was deleted successfully"}), 200
+            else:
+                return jsonify({"type": "error", "error": "Couldn't delete the conversation"}), 500
+
+        # -----------------------Dashboard-----------------------------
+        @self.flask_app.route("/api/add_chart", methods=["POST"])
+        @self.requires_auth
+        def add_chart(user):
+            """
+            Adds a new chart to the database.
+            ---
+            parameters:
+              - name: body
+                in: body
+                required: true
+                schema:
+                  type: object
+                  properties:
+                    chart_json:
+                      type: object
+            responses:
+              200:
+                description: Chart added successfully
+              400:
+                description: Missing chart_json in request body
+              500:
+                description: Failed to add chart
+            """
+
+            user_id = flask.request.cookies.get("session_id")
+            conv_id = flask.request.args.get("id", None)
+            if not conv_id:
+                return jsonify({"type": "error", "error": "`id` query-parameter is required"}), 400
+
+            chart_json_str = self.cache.get(conv_id,CacheTypes.FIG_JSON)
+            if chart_json_str is None:
+                if not request.json or 'chart_json' not in request.json:
+                    return jsonify({"error": "Missing chart_json in request body"}), 400
+
+                chart_json_str = json.dumps(request.json['chart_json'])
+
+            try:
+                chart_id = self.copilot.add_chart(chart_json_str)
+                return jsonfy({"success": True, "chart_id": chart_id})
+            except Exception as e:
+                self.copilot.log(f"Error adding chart: {e}", "Error")
+                return jsonify({"error": "Failed to add chart"}), 500
+
+        @self.flask_app.route("/api/get_charts", methods=["GET"])
+        @self.requires_auth
+        def get_charts(user):
+            """
+            Retrieves all charts from the database.
+            ---
+            responses:
+              200:
+                description: A list of charts
+              500:
+                description: Failed to retrieve charts
+            """
+            try:
+                charts = self.copilot.get_all_charts()
+                return jsonify({"charts": charts})
+            except Exception as e:
+                self.copilot.log(f"Error getting charts: {e}", "Error")
+                return jsonify({"error": "Failed to retrieve charts"}), 500
+
 
         @self.flask_app.route("/api/v0/<path:catch_all>", methods=["GET", "POST"])
         def catch_all(catch_all):
@@ -1805,7 +1888,7 @@ class FlaskAPI:
 
     def run(self, *args, **kwargs):
         # Ensure DB table exists and enable WAL before starting
-        CONVERSATION_DB_PATH = r"C:\Users\ACER\PycharmProjects\LogisticRegression\env\text2sql\webApp\data\conversations.db"
+        CONVERSATION_DB_PATH = r"./webApp/data/conversations.db"
 
         with sqlite3.connect(CONVERSATION_DB_PATH) as init_conn:
             init_conn.execute("PRAGMA journal_mode=WAL;")
