@@ -8,10 +8,7 @@ GMD-Copilot is a project that aims to provide an AI-powered copilot for various 
 
 You can view a video demonstration of the application below.
 
-[Watch the Demo](./demo/demo.mp4)
-
-Alternatively, here is an embedded version:
-<video src="https://github.com/AymanAitAhmed/GMD-Copilot/raw/main/demo/demo.mp4" controls="controls" style="max-width: 720px;">
+<video src="https://github.com/AymanAitAhmed/GMD-Copilot/blob/main/demo/demo.mp4" controls="controls" style="max-width: 720px;">
 </video>
 
 ## Features
